@@ -1,0 +1,554 @@
+"""Typed IBKR error/diagnostic classifier.
+
+The IBKR TWS API delivers status notifications, warnings, and genuine errors all
+through the same ``EWrapper.error(reqId, errorCode, errorString)`` callback. This
+module provides a structured classifier so callers can handle each tier correctly
+without inline ad-hoc membership tests.
+
+The full classification rule (the authoritative tier specification this module
+implements) is: classify by ``errorCode``, never by the ibapi client's log severity
+(the stock ``ibapi`` library logs every one of these callbacks, including benign
+status notices, at ``ERROR`` level). Codes 2100-2169 are system status
+notifications, not request failures, with two exceptions inside that band: text
+containing "broken" or "lost" means degraded connectivity (WARNING), and 1101/1102
+mean connectivity restored (INFORMATIONAL). Three codes sit outside the 2100-2169
+band but are still informational, not genuine errors: 2176 (a fractional-share
+order-size advisory — the order is still accepted), and 10167/10091 (delayed
+market data being substituted for a non-entitled real-time request — data is still
+delivered, just degraded). See the ``ErrorTier`` enum below for the full per-tier
+detail this module implements.
+
+Engine-free: no deephaven, no ibapi import. Pure stdlib only.
+"""
+
+from __future__ import annotations
+
+import enum
+import re
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+
+# ---------------------------------------------------------------------------
+# Tier enum
+# ---------------------------------------------------------------------------
+
+
+class ErrorTier(enum.Enum):
+    """Classification tier for an IBKR ``error()`` callback.
+
+    The IB API routes notifications, warnings, and genuine errors through the
+    same callback; this enum lets callers branch on meaning rather than raw
+    code.
+    """
+
+    INFORMATIONAL = "informational"
+    """System status notifications that require no action.
+
+    Codes in the 2100–2169 band that are NOT degradation signals: "…connection
+    is OK", subscription notes, order-entry advisory messages (e.g. bond
+    order-size), and session-level restore confirmations (1101, 1102).  Log at
+    INFO or drop entirely. Never abort or retry on these.
+    """
+
+    CONNECTIVITY_DEGRADED = "connectivity_degraded"
+    """A farm or TWS↔IB-server link has dropped — often transient.
+
+    Specific codes: 2103, 2105, 2157 ("…connection is broken"), 2110
+    (TWS↔server broken), 1100 (connectivity lost). Also any in-band 2100–2169
+    message whose text contains "broken" or "lost".  Log at WARNING; surface to
+    the user but do not crash — data pauses until 1101/1102 restores it.
+    """
+
+    MARKET_DATA_WARNING = "market_data_warning"
+    """Market-data subscription or entitlement notice — non-fatal.
+
+    10000-band codes that indicate delayed, substituted, or unavailable market
+    data due to subscription tier. Examples:
+
+    * 10167 — not subscribed; delayed data WILL follow (display continues).
+    * 10168 — market data farm is not delivering data (transient gap).
+    * 10197 — no data for contract (empty snapshot; not an API failure).
+    * 10089 — user data farm not connected (entitlement).
+    * 10091 — connectivity to exchange disrupted (entitlement / exchange issue).
+
+    These are warnings, not errors: the request completed, just with degraded
+    or absent market data. Log at WARNING; don't abort.
+    """
+
+    GENUINE_ERROR = "genuine_error"
+    """A request or connection actually failed — requires action.
+
+    Low/sub-1100 codes such as 502 (can't connect to TWS), 504 (not
+    connected), 326 (duplicate client id), 200 (no security definition), 162
+    (historical data error).  Log at ERROR; fail or retry as appropriate.  This
+    is also the default for any unrecognised code.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Classification tables
+# ---------------------------------------------------------------------------
+
+# Codes in the 2100–2169 band that specifically indicate degradation.
+_CONNECTIVITY_DEGRADED_CODES: frozenset[int] = frozenset({
+    2103,   # Market data farm connection is broken:<farm>
+    2105,   # Historical data farm connection is broken:<farm>
+    2110,   # Connectivity between Trader Workstation and server is broken
+    2157,   # Sec-def data farm connection is broken:<farm>
+    1100,   # Connectivity between IB and TWS has been lost
+})
+
+# Explicit restore notifications — treated as informational (connection is back).
+_CONNECTIVITY_RESTORED_CODES: frozenset[int] = frozenset({1101, 1102})
+
+# Individually-classified informational codes OUTSIDE the 2100-2169 band that would
+# otherwise fall through to the GENUINE_ERROR default. Classified by code, never by
+# ibapi's raw ERROR: log severity (see the module docstring above).
+#   2176 — fractional-share order requires API version >= 163 (order-entry advisory,
+#          the order is still accepted; same character as 2113's bond order-size note,
+#          just numbered outside the 2100-2169 band).
+_INFORMATIONAL_CODES: frozenset[int] = frozenset({2176})
+
+# In-band (2100–2169) range boundaries.
+_SYSTEM_BAND_LO: int = 2100
+_SYSTEM_BAND_HI: int = 2169  # inclusive
+
+# Non-fatal market-data subscription warnings in the 10000-band.
+# Keep this set small and each entry documented:
+#   10167 — "not subscribed — displaying delayed market data"; delayed ticks follow
+#   10168 — "market data farm connection is not available" (transient gap in feed)
+#   10197 — "no data for contract" (empty snapshot; contract may be halted/inactive)
+#   10089 — "user data farm connection is not available" (entitlement gap)
+#   10091 — "Connectivity between TWS and server is broken" for market-data sub-system
+_MARKET_DATA_WARNING_CODES: frozenset[int] = frozenset({
+    10089,
+    10091,
+    10167,
+    10168,
+    10197,
+})
+
+# Regex to detect degradation language in in-band messages.
+_DEGRADED_RE: re.Pattern[str] = re.compile(r"\b(broken|lost)\b", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Core classifier
+# ---------------------------------------------------------------------------
+
+
+def classify_error(code: int, message: str | None = None) -> ErrorTier:
+    """Classify an IBKR ``error()`` callback into its semantic tier.
+
+    Parameters
+    ----------
+    code:
+        The ``errorCode`` delivered by ``EWrapper.error``.
+    message:
+        The ``errorString`` from the same callback. Optional; used to refine
+        classification for in-band (2100–2169) messages that signal degradation
+        via their text ("broken", "lost") rather than their code alone.
+
+    Returns
+    -------
+    :class:`ErrorTier`
+        The semantic tier for this code/message pair.
+
+    Examples
+    --------
+    >>> classify_error(2104)
+    <ErrorTier.INFORMATIONAL: 'informational'>
+    >>> classify_error(2103)
+    <ErrorTier.CONNECTIVITY_DEGRADED: 'connectivity_degraded'>
+    >>> classify_error(1100)
+    <ErrorTier.CONNECTIVITY_DEGRADED: 'connectivity_degraded'>
+    >>> classify_error(502)
+    <ErrorTier.GENUINE_ERROR: 'genuine_error'>
+    >>> classify_error(10167)
+    <ErrorTier.MARKET_DATA_WARNING: 'market_data_warning'>
+    >>> classify_error(2176)
+    <ErrorTier.INFORMATIONAL: 'informational'>
+    """
+    # Explicit connectivity-degraded codes (some are in-band, 1100 is not).
+    if code in _CONNECTIVITY_DEGRADED_CODES:
+        return ErrorTier.CONNECTIVITY_DEGRADED
+
+    # Restore notifications are informational (connection is back).
+    if code in _CONNECTIVITY_RESTORED_CODES:
+        return ErrorTier.INFORMATIONAL
+
+    # Individually-classified informational codes outside the 2100-2169 band (2176).
+    if code in _INFORMATIONAL_CODES:
+        return ErrorTier.INFORMATIONAL
+
+    # 2100–2169: system-notification band.
+    if _SYSTEM_BAND_LO <= code <= _SYSTEM_BAND_HI:
+        # Message-content override: in-band codes whose text signals degradation.
+        if message is not None and _DEGRADED_RE.search(message):
+            return ErrorTier.CONNECTIVITY_DEGRADED
+        return ErrorTier.INFORMATIONAL
+
+    # 10000-band market-data subscription warnings.
+    if code in _MARKET_DATA_WARNING_CODES:
+        return ErrorTier.MARKET_DATA_WARNING
+
+    # Default: genuine error (low codes + anything unrecognised).
+    return ErrorTier.GENUINE_ERROR
+
+
+# ---------------------------------------------------------------------------
+# Convenience predicates
+# ---------------------------------------------------------------------------
+
+
+def is_fatal(code: int, message: str | None = None) -> bool:
+    """Return True iff this code is a :attr:`~ErrorTier.GENUINE_ERROR`.
+
+    Use this to gate abort/retry logic.
+
+    Parameters
+    ----------
+    code:
+        The ``errorCode`` from the callback.
+    message:
+        The ``errorString``; forwarded to :func:`classify_error`.
+    """
+    return classify_error(code, message) is ErrorTier.GENUINE_ERROR
+
+
+def is_connectivity_event(code: int) -> bool:
+    """Return True iff this code relates to connectivity (degraded or restored).
+
+    Covers both loss (:attr:`~ErrorTier.CONNECTIVITY_DEGRADED`) and restore
+    (1101 / 1102 — :attr:`~ErrorTier.INFORMATIONAL` but connectivity-class).
+    Use this to trigger reconnection state machines.
+    """
+    return code in _CONNECTIVITY_DEGRADED_CODES or code in _CONNECTIVITY_RESTORED_CODES
+
+
+def is_connection_lost(code: int) -> bool:
+    """Return True iff 1100 (connectivity between IB and TWS lost).
+
+    This is the hard-loss signal; data will pause until 1101/1102 restores.
+    """
+    return code == 1100
+
+
+def is_connection_restored(code: int) -> bool:
+    """Return True iff 1101 or 1102 (connectivity restored after loss).
+
+    1101 — restored; any subscriptions that were lost need re-subscribing.
+    1102 — restored; existing subscriptions are preserved.
+    """
+    return code in _CONNECTIVITY_RESTORED_CODES
+
+
+# ---------------------------------------------------------------------------
+# Farm-status parser
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FarmStatus:
+    """Parsed content of an IBKR data-farm status message.
+
+    IBKR sends farm status through the ``error()`` callback with messages like:
+
+    * ``"Market data farm connection is OK:usfarm"``
+    * ``"Historical data farm connection is broken:ushmds"``
+    * ``"HMDS data farm connection is inactive but should be available upon demand.ushmds"``
+
+    Attributes
+    ----------
+    farm:
+        The farm identifier extracted from the message suffix (e.g. ``"usfarm"``,
+        ``"hfarm"``), or ``None`` when the message has no farm suffix.
+    kind:
+        Whether this is a ``"market_data"`` or ``"historical_data"`` farm, or
+        ``"unknown"`` when the prefix doesn't match either pattern.
+    is_ok:
+        ``True`` when the farm reported OK/available; ``False`` when broken or
+        inactive.
+    """
+
+    farm: str | None
+    kind: Literal["market_data", "historical_data", "unknown"]
+    is_ok: bool
+
+
+# Patterns for the two farm kinds seen in the wild.
+# "Market data farm" also matches "Sec-def data farm" (we call that market_data for
+# simplicity since it carries the same operational implication).
+_FARM_PATTERN: re.Pattern[str] = re.compile(
+    r"""
+    ^
+    (?P<kind>Market\ data|Historical\ data|HMDS\ data|Sec-def\ data)
+    \ farm\ connection\ is\ (?P<status>[^:.]+)     # "OK", "broken", "inactive but..."
+    (?:[.:](?P<farm>\S+))?                          # optional ":usfarm" or ".ushmds"
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Terms that indicate the farm is NOT OK.
+_NOT_OK_RE: re.Pattern[str] = re.compile(r"\b(broken|inactive|lost|not available)\b", re.IGNORECASE)
+
+
+def classify_farm(message: str) -> FarmStatus | None:
+    """Parse an IBKR farm-status ``errorString`` into a :class:`FarmStatus`.
+
+    Returns ``None`` when *message* is not a farm-status line.
+
+    Parameters
+    ----------
+    message:
+        The raw ``errorString`` from ``EWrapper.error`` — e.g.
+        ``"Market data farm connection is OK:usfarm"``.
+
+    Returns
+    -------
+    :class:`FarmStatus` or ``None``
+        Parsed farm status, or ``None`` for non-farm messages.
+
+    Examples
+    --------
+    >>> classify_farm("Market data farm connection is OK:usfarm")
+    FarmStatus(farm='usfarm', kind='market_data', is_ok=True)
+    >>> classify_farm("Historical data farm connection is broken:ushmds")
+    FarmStatus(farm='ushmds', kind='historical_data', is_ok=False)
+    >>> classify_farm("[502] Could not connect to TWS")
+    None
+    """
+    m = _FARM_PATTERN.match(message.strip())
+    if m is None:
+        return None
+
+    raw_kind = m.group("kind").lower()
+    if "historical" in raw_kind or "hmds" in raw_kind:
+        kind: Literal["market_data", "historical_data", "unknown"] = "historical_data"
+    elif "market" in raw_kind or "sec-def" in raw_kind:
+        kind = "market_data"
+    else:
+        kind = "unknown"
+
+    status_text = m.group("status")
+    is_ok = not bool(_NOT_OK_RE.search(status_text))
+
+    raw_farm = m.group("farm")
+    farm: str | None = raw_farm.strip() if raw_farm else None
+
+    return FarmStatus(farm=farm, kind=kind, is_ok=is_ok)
+
+
+# ---------------------------------------------------------------------------
+# Typed diagnostic event
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class IbDiagnostic:
+    """Typed representation of one IBKR ``EWrapper.error()`` invocation.
+
+    Bundles the raw callback arguments with their semantic classification and
+    optional farm parsing. Consumers can stream these through queues, log them,
+    or pattern-match on :attr:`tier` without re-implementing the classifier.
+
+    Attributes
+    ----------
+    code:
+        The raw ``errorCode``.
+    tier:
+        Semantic tier from :func:`classify_error`.
+    message:
+        The raw ``errorString``.
+    farm:
+        Parsed :class:`FarmStatus` if *message* is a farm-status line, else
+        ``None``.
+    req_id:
+        The ``reqId`` from the callback, or ``None`` when constructed without
+        one. ``-1`` is the TWS sentinel for "not associated with a request".
+    """
+
+    code: int
+    tier: ErrorTier
+    message: str
+    farm: FarmStatus | None
+    req_id: int | None = None
+
+    @classmethod
+    def from_callback(cls, req_id: int, code: int, message: str) -> IbDiagnostic:
+        """Construct an :class:`IbDiagnostic` from raw ``EWrapper.error`` arguments.
+
+        Runs :func:`classify_error` and :func:`classify_farm` and returns a
+        fully populated, immutable diagnostic event. This is the primary
+        factory; call it from your ``error()`` override.
+
+        Parameters
+        ----------
+        req_id:
+            The ``reqId`` argument from ``EWrapper.error``.
+        code:
+            The ``errorCode`` argument.
+        message:
+            The ``errorString`` argument.
+        """
+        return cls(
+            code=code,
+            tier=classify_error(code, message),
+            message=message,
+            farm=classify_farm(message),
+            req_id=req_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Connection-health surface
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConnectionHealth:
+    """Snapshot of live IBKR connection health derived from the ``errors`` table.
+
+    Attributes
+    ----------
+    connected:
+        Result of ``supervisor.is_connected()``; ``True`` when that call raises.
+    tier_counts:
+        Mapping from :class:`ErrorTier` name to count of rows in that tier.
+    genuine_errors:
+        List of ``{"code": int, "description": str}`` dicts for every row
+        classified as :attr:`~ErrorTier.GENUINE_ERROR`.
+    farms:
+        Mapping from farm name (e.g. ``"usfarm"``) to latest ``is_ok`` value.
+        When the same farm appears multiple times, the last row wins.
+    connection_lost:
+        ``True`` iff a code-1100 (connectivity lost) event appears in the error
+        rows without a subsequent code-1101 or code-1102 (restore) event.
+    summary:
+        Human-readable one-line digest of the health state.
+    """
+
+    connected: bool
+    tier_counts: dict[str, int] = field(default_factory=dict)
+    genuine_errors: list[dict[str, Any]] = field(default_factory=list)
+    farms: dict[str, bool] = field(default_factory=dict)
+    connection_lost: bool = False
+    summary: str = ""
+
+
+def connection_health(supervisor: Any) -> ConnectionHealth:
+    """Classify every row in the live ``errors`` table and return a health snapshot.
+
+    Reads ``supervisor.snapshot_raw_rows("errors")`` and classifies each row
+    using :func:`classify_error` and :func:`classify_farm`.  Both the connected
+    query and the table read are wrapped so that an unavailable supervisor or a
+    missing ``errors`` table degrade gracefully rather than raising.
+
+    Parameters
+    ----------
+    supervisor:
+        A live ``IbkrSupervisor`` (or any object exposing
+        ``snapshot_raw_rows(name: str) -> list[dict]`` and
+        ``is_connected() -> bool``).
+
+    Returns
+    -------
+    :class:`ConnectionHealth`
+        Immutable snapshot — safe to cache or serialise.
+
+    Examples
+    --------
+    >>> ch = connection_health(supervisor)
+    >>> ch.connected
+    True
+    >>> ch.tier_counts
+    {'INFORMATIONAL': 5}
+    """
+    # --- connected ----------------------------------------------------------
+    connected: bool = True
+    try:
+        connected = bool(supervisor.is_connected())
+    except Exception:  # noqa: BLE001 — unknown supervisor implementation; default safe
+        pass
+
+    # --- rows ---------------------------------------------------------------
+    rows: list[dict[str, Any]] = []
+    try:
+        rows = list(supervisor.snapshot_raw_rows("errors"))
+    except Exception:  # noqa: BLE001 — table may not exist yet; graceful degradation
+        pass
+
+    # --- iterate ------------------------------------------------------------
+    tier_counts: dict[str, int] = {}
+    genuine_errors: list[dict[str, Any]] = []
+    farms: dict[str, bool] = {}
+    connection_lost: bool = False
+
+    for row in rows:
+        raw_code = row.get("ErrorCode")
+        try:
+            code = int(raw_code)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+
+        msg = str(row.get("Error") or row.get("ErrorDescription") or "")
+        tier = classify_error(code, msg)
+        tier_counts[tier.name] = tier_counts.get(tier.name, 0) + 1
+
+        if tier is ErrorTier.GENUINE_ERROR:
+            desc = str(row.get("ErrorDescription") or msg)
+            genuine_errors.append({"code": code, "description": desc})
+
+        farm = classify_farm(msg)
+        if farm is not None and farm.farm is not None:
+            farms[farm.farm] = farm.is_ok
+
+        if is_connection_lost(code):
+            connection_lost = True
+        elif is_connection_restored(code):
+            connection_lost = False
+
+    # --- summary ------------------------------------------------------------
+    parts: list[str] = []
+    parts.append("connected" if connected else "DISCONNECTED")
+    if genuine_errors:
+        codes = ", ".join(str(g["code"]) for g in genuine_errors)
+        parts.append(f"{len(genuine_errors)} genuine error(s) [{codes}]")
+    else:
+        parts.append("no genuine errors")
+    if farms:
+        farm_strs = [f"{name}={'OK' if ok else 'BROKEN'}" for name, ok in sorted(farms.items())]
+        parts.append("farms: " + ", ".join(farm_strs))
+    if connection_lost:
+        parts.append("connectivity LOST")
+
+    summary = "; ".join(parts)
+
+    return ConnectionHealth(
+        connected=connected,
+        tier_counts=tier_counts,
+        genuine_errors=genuine_errors,
+        farms=farms,
+        connection_lost=connection_lost,
+        summary=summary,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public surface
+# ---------------------------------------------------------------------------
+
+__all__ = [
+    "ConnectionHealth",
+    "ErrorTier",
+    "FarmStatus",
+    "IbDiagnostic",
+    "classify_error",
+    "classify_farm",
+    "connection_health",
+    "is_connection_lost",
+    "is_connection_restored",
+    "is_connectivity_event",
+    "is_fatal",
+]

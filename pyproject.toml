@@ -1,0 +1,93 @@
+[project]
+name = "ibda"
+version = "0.1.0"
+description = "An engine-agnostic port/adapter layer over an IBKR account, served through Deephaven."
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    # Embeds an in-process Deephaven JVM (`deephaven_server.Server`) and provides the
+    # `deephaven` Python API (`deephaven-core`, pulled in transitively) that
+    # `ibda.adapters.deephaven` builds tables against. Pinned, not floated: the vendored
+    # `deephaven-ib` fork (see DEPENDENCIES.md) is built and tested against exactly this
+    # version, and an untested newer server could drift the wire/JVM contract underneath it.
+    "deephaven-server==41.6",
+    # The patched fork, NOT the PyPI package of the same name -- see DEPENDENCIES.md for
+    # exactly which patches ibda requires and why. Point this at your own copy of the fork
+    # (see SETUP.md); a bare `deephaven-ib` from PyPI is missing every patch listed there.
+    "deephaven-ib>=0.6.3",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    # PyPI's `ibapi` has exactly one release, 9.81.1.post1 (2020-12-06); IB never
+    # published 10.x there. See SETUP.md for how to build a 10.19.04 wheel from IB's own
+    # TWS API distribution, and why 10.19.04 specifically (not IB's newer "Stable"/"Latest").
+    "ibapi==10.19.4",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+    "pytest>=9.0.3",
+    "ruff>=0.15.17",
+]
+
+[tool.uv.sources]
+# Uncomment and point at wherever you placed the patched fork (see SETUP.md). Left
+# commented so `uv sync` doesn't fail out of the box for a reader who hasn't fetched it
+# yet; the plain PyPI `deephaven-ib` resolves otherwise, which is NOT what you want to run
+# against (see DEPENDENCIES.md).
+# deephaven-ib = { path = "./deephaven-ib" }
+ibapi = { path = "vendor/ibapi-10.19.4-py3-none-any.whl" }
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+# ibda/tests_jvm is intentionally EXCLUDED: those tests construct an in-process Deephaven
+# Server (JVM), and only one Server may exist per process. Run that lane explicitly with
+# `uv run pytest ibda/tests_jvm`.
+testpaths = [
+    "ibda/tests",
+    "ibda/analytics/tests",
+]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["ibda", "tools", "examples"]
+mypy_path = "."
+explicit_package_bases = true
+namespace_packages = true
+strict = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# These libraries ship no (or only partial) type stubs. follow_imports = "skip" treats
+# them as fully untyped (Any) so strict's no_implicit_reexport doesn't flag re-exports
+# from their surface.
+module = ["deephaven.*", "deephaven_ib.*", "deephaven_server.*", "ibapi.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+# Deliberately narrow: pyflakes (real defects) plus the pycodestyle errors that catch
+# genuine mistakes -- not an opinionated style sweep.
+select = ["F", "E4", "E7", "E9", "W6"]
+ignore = [
+    # Deferred/function-local imports are required in several adapters (vendor imports
+    # kept lazy so importing `ibda` alone never pulls in `deephaven`/`deephaven_ib`).
+    "E402",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["F841"]
+"**/test_*.py" = ["F841"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ibda"]

@@ -1,0 +1,43 @@
+<FlexQueryResponse queryName="Activity" type="AF">
+<FlexStatements count="1">
+<FlexStatement accountId="U0000001" fromDate="2026-06-01" toDate="2026-06-08" period="MTD">
+<Trades>
+  <!-- STK: NVDA BUY, ibExecID present -->
+  <Trade accountId="U0000001" symbol="NVDA" assetCategory="STK"
+    tradeDate="2026-06-02" dateTime="2026-06-02 09:45:00"
+    buySell="BUY" quantity="50" tradePrice="875.50"
+    proceeds="-43775.00" ibCommission="-1.00" ibCommissionCurrency="USD"
+    netCash="-43776.00" fifoPnlRealized="0" currency="USD"
+    ibExecID="0000e9bf.667fe2a3.01.01" conid="4815747" exchange="ISLAND"/>
+
+  <!-- OPT: AAPL call BUY, ibExecID present, multiplier=100 -->
+  <Trade accountId="U0000001" symbol="AAPL  260117C00200000" assetCategory="OPT"
+    tradeDate="2026-06-03" dateTime="2026-06-03 10:15:00"
+    buySell="BUY" quantity="5" tradePrice="3.20"
+    proceeds="-1600.00" ibCommission="-0.70" ibCommissionCurrency="USD"
+    netCash="-1600.70" fifoPnlRealized="0" currency="USD" multiplier="100"
+    ibExecID="0000e9bf.667fe2a3.02.01" conid="678901234" exchange="CBOE"/>
+
+  <!-- FUT: ESM6 SELL, tradeID present but NO ibExecID — tests fallback to tradeID -->
+  <Trade accountId="U0000001" symbol="ESM6" assetCategory="FUT"
+    tradeDate="2026-06-04" dateTime="2026-06-04 14:00:00"
+    buySell="SELL" quantity="-2" tradePrice="5305.00"
+    proceeds="530500.00" ibCommission="-4.20" ibCommissionCurrency="USD"
+    netCash="530495.80" fifoPnlRealized="1200.00" currency="USD" multiplier="50"
+    tradeID="123456789" conid="495512568" exchange="CME"/>
+
+  <!-- CASH (FX): EUR.USD BUY, NO ibExecID and NO tradeID — exercises synthetic id -->
+  <Trade accountId="U0000001" symbol="EUR.USD" assetCategory="CASH"
+    tradeDate="2026-06-05" dateTime="2026-06-05 11:30:00"
+    buySell="BUY" quantity="100000" tradePrice="1.08520"
+    proceeds="-108520.00" ibCommission="-2.00" ibCommissionCurrency="USD"
+    netCash="-108522.00" fifoPnlRealized="0" currency="USD"
+    conid="12087792" exchange="IDEALPRO"/>
+</Trades>
+<CashTransactions>
+  <CashTransaction accountId="U0000001" symbol="" type="Broker Interest Received"
+    dateTime="2026-06-04" amount="5.10" currency="USD" description="CREDIT INT"/>
+</CashTransactions>
+</FlexStatement>
+</FlexStatements>
+</FlexQueryResponse>

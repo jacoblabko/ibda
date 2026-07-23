@@ -1,0 +1,32 @@
+<FlexQueryResponse queryName="Activity" type="AF">
+<FlexStatements count="1">
+<FlexStatement accountId="U1111111" fromDate="2026-06-01" toDate="2026-06-04" period="Custom">
+<Trades/>
+<CashTransactions/>
+<CorporateActions/>
+<Transfers>
+  <!-- ACATS in-kind transfer: 200 shares of MSFT IN at $420.00/share.
+       positionAmount=84000, positionAmountInBase=84000 (USD base), direction=IN. -->
+  <Transfer accountId="U1111111" symbol="MSFT" type="ACATS"
+    dateTime="2026-06-02" direction="IN"
+    quantity="200" transferPrice="420.00"
+    positionAmount="84000.00" positionAmountInBase="84000.00"
+    currency="USD" description="ACATS TRANSFER IN"/>
+</Transfers>
+<EquitySummaryInBase>
+  <!-- NAV series: day-1 base, then transfer arrives on day-2, small market move on day-3/4 -->
+  <EquitySummaryByReportDateInBase accountId="U1111111" reportDate="2026-06-01"
+    cash="200000.00" stock="100000.00" total="300000.00"/>
+  <!-- Day-2: MSFT transferred in (NAV jumps by ~84000 but that is external flow) -->
+  <EquitySummaryByReportDateInBase accountId="U1111111" reportDate="2026-06-02"
+    cash="200000.00" stock="184000.00" total="384000.00"/>
+  <!-- Day-3: small +1500 market gain -->
+  <EquitySummaryByReportDateInBase accountId="U1111111" reportDate="2026-06-03"
+    cash="200000.00" stock="185500.00" total="385500.00"/>
+  <!-- Day-4: small -500 market loss -->
+  <EquitySummaryByReportDateInBase accountId="U1111111" reportDate="2026-06-04"
+    cash="200000.00" stock="185000.00" total="385000.00"/>
+</EquitySummaryInBase>
+</FlexStatement>
+</FlexStatements>
+</FlexQueryResponse>

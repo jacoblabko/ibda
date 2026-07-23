@@ -1,0 +1,32 @@
+<FlexQueryResponse queryName="Activity" type="AF">
+<FlexStatements count="1">
+<FlexStatement accountId="U0000002" fromDate="2026-06-01" toDate="2026-06-08" period="MTD">
+<Trades>
+<!-- EXECUTION-level: two real fills that make up one order. -->
+<Trade accountId="U0000002" symbol="TSLA" assetCategory="STK" tradeDate="2026-06-02"
+  dateTime="2026-06-02 10:00:00" buySell="BUY" quantity="60" tradePrice="250.00"
+  proceeds="-15000.00" ibCommission="-1.20" ibCommissionCurrency="USD"
+  netCash="-15001.20" fifoPnlRealized="0" currency="USD"
+  ibExecID="0000abcd.11111111.01.01" levelOfDetail="EXECUTION"/>
+<Trade accountId="U0000002" symbol="TSLA" assetCategory="STK" tradeDate="2026-06-02"
+  dateTime="2026-06-02 10:00:01" buySell="BUY" quantity="40" tradePrice="250.10"
+  proceeds="-10004.00" ibCommission="-0.80" ibCommissionCurrency="USD"
+  netCash="-10004.80" fifoPnlRealized="0" currency="USD"
+  ibExecID="0000abcd.11111111.02.01" levelOfDetail="EXECUTION"/>
+<!-- ORDER-level: the same order rolled up (aggregate qty/price) — must be dropped. -->
+<Trade accountId="U0000002" symbol="TSLA" assetCategory="STK" tradeDate="2026-06-02"
+  dateTime="2026-06-02 10:00:01" buySell="BUY" quantity="100" tradePrice="250.04"
+  proceeds="-25004.00" ibCommission="-2.00" ibCommissionCurrency="USD"
+  netCash="-25006.00" fifoPnlRealized="0" currency="USD"
+  ibOrderID="55501" levelOfDetail="ORDER"/>
+<!-- CLOSED_LOT-level: FIFO lot-matching detail for a later closing trade — must be dropped. -->
+<Trade accountId="U0000002" symbol="TSLA" assetCategory="STK" tradeDate="2026-06-05"
+  dateTime="2026-06-05 15:00:00" buySell="SELL" quantity="-100" tradePrice="260.00"
+  proceeds="26000.00" ibCommission="-2.00" ibCommissionCurrency="USD"
+  netCash="25998.00" fifoPnlRealized="995.00" currency="USD"
+  levelOfDetail="CLOSED_LOT"/>
+</Trades>
+<CashTransactions/>
+</FlexStatement>
+</FlexStatements>
+</FlexQueryResponse>
