@@ -49,6 +49,21 @@ class _FakeCD:
 class _FakeRC:
     contract_details = [_FakeCD()]
 
+    def is_multi(self) -> bool:
+        return False
+
+
+class _FakeMultiRC:
+    """A registered contract that resolved to >1 ContractDetails (e.g. SPY's
+    SMART option chain resolving to both '2SPY' and 'SPY') -- Fix D's
+    ``rc.is_multi()`` guard must skip this rather than let it fan out into
+    N ``reqMktData`` calls / N market-data lines."""
+
+    contract_details = [_FakeCD(), _FakeCD()]
+
+    def is_multi(self) -> bool:
+        return True
+
 
 class _FakeClient:
     def __init__(self) -> None:
@@ -247,17 +262,20 @@ class _GreeksClient:
 
 
 class _GreeksSession:
-    def __init__(self) -> None:
+    def __init__(self, rc: Any = None) -> None:
         self._client = _GreeksClient()
         self.market_data_calls: list[Any] = []
+        self.registered_contracts: list[Any] = []
+        self._rc = rc if rc is not None else _FakeRC()
         # Stub table objects; the injected snapshot_rows_where_fn ignores the raw
         # table arg, but supervisor.raw_table() is called unconditionally first.
         self.tables: dict[str, Any] = {
             "ticks_option_computation": object(),
         }
 
-    def get_registered_contract(self, contract: object) -> _FakeRC:
-        return _FakeRC()
+    def get_registered_contract(self, contract: object) -> Any:
+        self.registered_contracts.append(contract)
+        return self._rc
 
     def request_market_data(self, rc: object, snapshot: bool = False) -> None:
         self.market_data_calls.append((rc, snapshot))
@@ -280,6 +298,35 @@ def test_subscribe_option_greeks_resolves_and_requests() -> None:
     conid = subscribe_option_greeks(sup, "AAPL", "20260117", 195.0, "C")
     assert conid == 265598
     assert len(session.market_data_calls) == 1
+
+
+def test_subscribe_option_greeks_passes_trading_class_to_built_contract() -> None:
+    """Fix D: an explicit ``trading_class`` (e.g. an already-parsed
+    ``OptionParams.trading_class``) must reach the built ``Contract`` passed to
+    ``get_registered_contract`` -- this is what lets IBKR disambiguate a
+    multi-trading-class underlying (SPY) down to a single ``ContractDetails``."""
+    session = _GreeksSession()
+    sup = IbkrSupervisor.from_session(session)
+    conid = subscribe_option_greeks(
+        sup, "SPY", "20260117", 450.0, "C", trading_class="SPY"
+    )
+    assert conid == 265598
+    assert len(session.registered_contracts) == 1
+    assert session.registered_contracts[0].tradingClass == "SPY"
+
+
+def test_subscribe_option_greeks_skips_ambiguous_multi_contract() -> None:
+    """Fix D: when the registered contract resolves to >1 ContractDetails
+    (``rc.is_multi() is True`` -- e.g. SPY's SMART chain without a
+    ``trading_class``, live-verified 2026-07-16), ``subscribe_option_greeks``
+    must return ``None`` and NEVER call ``request_market_data`` -- mirroring
+    ``marketdata.py``'s ``request_intraday_bars`` guard -- rather than letting
+    the ambiguous contract fan out into N market-data lines for one call."""
+    session = _GreeksSession(rc=_FakeMultiRC())
+    sup = IbkrSupervisor.from_session(session)
+    conid = subscribe_option_greeks(sup, "SPY", "20260117", 450.0, "C")
+    assert conid is None
+    assert session.market_data_calls == []
 
 
 def test_latest_option_greeks_picks_matching_conid() -> None:

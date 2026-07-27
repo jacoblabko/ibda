@@ -1,0 +1,64 @@
+<FlexQueryResponse queryName="Activity" type="AF">
+<FlexStatements count="2">
+<FlexStatement accountId="U1111111" fromDate="2026-06-01" toDate="2026-06-08" period="MTD">
+<Trades>
+<Trade accountId="U1111111" symbol="AAPL" assetCategory="STK" tradeDate="2026-06-02"
+  dateTime="2026-06-02 10:31:00" buySell="BUY" quantity="100" tradePrice="314.18"
+  proceeds="-31418.00" ibCommission="-1.00" ibCommissionCurrency="USD"
+  netCash="-31419.00" fifoPnlRealized="0" currency="USD"/>
+<Trade accountId="U1111111" symbol="AAPL" assetCategory="STK" tradeDate="2026-06-05"
+  dateTime="2026-06-05 15:45:00" buySell="SELL" quantity="-100" tradePrice="320.00"
+  proceeds="32000.00" ibCommission="-1.00" ibCommissionCurrency="USD"
+  netCash="31999.00" fifoPnlRealized="581.00" currency="USD"
+  orderReference="demo-x1" openCloseIndicator="C" ibOrderID="9988771"/>
+</Trades>
+<CashTransactions>
+<CashTransaction accountId="U1111111" symbol="MSFT" type="Dividends"
+  dateTime="2026-06-03" amount="42.50" currency="USD"
+  description="MSFT CASH DIVIDEND"/>
+</CashTransactions>
+<CorporateActions>
+</CorporateActions>
+<ChangeInNAV accountId="U1111111" fromDate="2026-06-01" toDate="2026-06-08"
+  startingValue="1000000.00" endingValue="1004580.00" mtm="4580.00"
+  realized="581.00" depositsWithdrawals="0" dividends="42.50"/>
+<FIFOPerformanceSummaryInBase>
+<FIFOPerformanceSummaryUnderlying accountId="U1111111" symbol="AAPL"
+  realizedTotal="581.00" unrealizedTotal="0" totalFifoPnl="581.00"/>
+</FIFOPerformanceSummaryInBase>
+<EquitySummaryInBase>
+<EquitySummaryByReportDateInBase accountId="U1111111" reportDate="20260601"
+  cash="500000.00" stock="500000.00" total="1000000.00"/>
+<EquitySummaryByReportDateInBase accountId="U1111111" reportDate="20260608"
+  cash="500624.21" stock="503955.79" total="1004580.00"/>
+</EquitySummaryInBase>
+</FlexStatement>
+<FlexStatement accountId="U2222222" fromDate="2026-06-01" toDate="2026-06-08" period="MTD">
+<Trades>
+<Trade accountId="U2222222" symbol="MSFT" assetCategory="STK" tradeDate="2026-06-03"
+  dateTime="2026-06-03 11:05:00" buySell="BUY" quantity="50" tradePrice="410.00"
+  proceeds="-20500.00" ibCommission="-1.50" ibCommissionCurrency="USD"
+  netCash="-20501.50" fifoPnlRealized="0" currency="USD"/>
+</Trades>
+<CashTransactions>
+<CashTransaction accountId="U2222222" symbol="" type="Broker Interest Received"
+  dateTime="2026-06-04" amount="1.75" currency="USD" description="CREDIT INT"/>
+</CashTransactions>
+<CorporateActions>
+</CorporateActions>
+<ChangeInNAV accountId="U2222222" fromDate="2026-06-01" toDate="2026-06-08"
+  startingValue="500000.00" endingValue="500250.00" mtm="250.00"
+  realized="0" depositsWithdrawals="0" dividends="0"/>
+<FIFOPerformanceSummaryInBase>
+<FIFOPerformanceSummaryUnderlying accountId="U2222222" symbol="MSFT"
+  realizedTotal="0" unrealizedTotal="250.00" totalFifoPnl="250.00"/>
+</FIFOPerformanceSummaryInBase>
+<EquitySummaryInBase>
+<EquitySummaryByReportDateInBase accountId="U2222222" reportDate="20260601"
+  cash="500000.00" stock="0" total="500000.00"/>
+<EquitySummaryByReportDateInBase accountId="U2222222" reportDate="20260608"
+  cash="479498.50" stock="20750.00" total="500250.00"/>
+</EquitySummaryInBase>
+</FlexStatement>
+</FlexStatements>
+</FlexQueryResponse>

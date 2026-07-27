@@ -24,6 +24,7 @@ from ibda.adapters.ibkr.diagnostics import (
     is_connection_restored,
     is_connectivity_event,
     is_fatal,
+    is_market_data_denied,
 )
 
 
@@ -93,11 +94,37 @@ class TestClassifyErrorConnectivityDegraded:
 
 
 class TestClassifyErrorMarketDataWarning:
-    """10000-band market-data subscription codes."""
+    """10000-band codes that DELIVERED data, just degraded.
 
-    @pytest.mark.parametrize("code", [10167, 10168, 10197, 10089, 10091])
-    def test_market_data_warning(self, code: int) -> None:
+    Membership turns on one question — did ticks arrive? — not on the shared 100xx
+    prefix. 10167 and 10091 both carry an explicit delayed-data clause in IB's own
+    wording, so a caller has data in hand.
+    """
+
+    @pytest.mark.parametrize("code", [10167, 10091])
+    def test_delivered_but_degraded_is_a_warning(self, code: int) -> None:
         assert classify_error(code) is ErrorTier.MARKET_DATA_WARNING
+
+    @pytest.mark.parametrize("code", [10089, 10168, 10197])
+    def test_denials_are_genuine_errors_not_warnings(self, code: int) -> None:
+        """Nothing is delivered for these — the request failed.
+
+        Until 2026-07-27 they sat in MARKET_DATA_WARNING under a docstring promising
+        "the request completed". It had not: 10089 returned no bid/ask on every cycle
+        under market_data_type 1 AND 3, and 10197 ran a ~31s retry loop 158 times
+        against a competing-session wall.
+        """
+        assert classify_error(code) is ErrorTier.GENUINE_ERROR
+
+    @pytest.mark.parametrize("code", [10089, 10168, 10197])
+    def test_denials_are_identifiable_as_market_data_denials(self, code: int) -> None:
+        """GENUINE_ERROR is the tier; the denial predicate keeps the per-contract fact."""
+        assert is_market_data_denied(code) is True
+        assert is_fatal(code) is True
+
+    @pytest.mark.parametrize("code", [10167, 10091, 2104, 502, 1100])
+    def test_nothing_else_is_a_market_data_denial(self, code: int) -> None:
+        assert is_market_data_denied(code) is False
 
 
 class TestClassifyErrorInformationalOutOfBand:

@@ -93,6 +93,31 @@ _COMMISSION_SIGN_FLIP_COLS: set[tuple[str, str]] = {
     ("commission", "Commission"),
 }
 
+# Live PnL columns that carry IBKR's Double.MAX_VALUE (1.7976931348623157e308)
+# sentinel for "not yet computed" instead of a null. Mirrors the scrub already
+# applied on the Arrow snapshot path (``ibda.adapters.ibkr.pnl._f``: "IBKR uses
+# Double.MAX_VALUE as a sentinel for 'not yet available'") and the vendored
+# deephaven-ib fork's commissionReport ``map_null_value`` scrub of the same
+# sentinel for RealizedPNL. Detected by (schema_name, canonical_col) pair,
+# mirroring _STRING_TO_DOUBLE_COLS / _SIDE_NORMALIZE_COLS above.
+#
+# Unlike the Arrow snapshot path, the live deephaven-view path
+# (apply_canonical_view) previously did no sentinel handling at all: a
+# ``sum(RealizedPnl)`` (or any other component) over the live ~2,100-position
+# book would add ~1.8e308 per not-yet-computed row — an astronomically wrong
+# aggregate rather than a merely-incomplete one. Scrubbed here so both the
+# Arrow snapshot and live-view paths agree that "not yet available" is
+# represented as null, never as the raw IBKR sentinel value.
+_PNL_SENTINEL_SCRUB_COLS: set[tuple[str, str]] = {
+    ("position_pnl", "DailyPnl"),
+    ("position_pnl", "UnrealizedPnl"),
+    ("position_pnl", "RealizedPnl"),
+    ("position_pnl", "MarketValue"),
+    ("account_pnl", "DailyPnl"),
+    ("account_pnl", "UnrealizedPnl"),
+    ("account_pnl", "RealizedPnl"),
+}
+
 
 def _col_types(tbl: Any) -> dict[str, str]:
     """Return {column_name: DataType_string} by reading *tbl*'s meta_table.
@@ -170,8 +195,11 @@ def apply_canonical_view(
     1.5. Value-level normalizations for columns whose live-path vocabulary or
          sign differs from the canonical convention (e.g. execution.Side's
          "BOT"/"SLD" → "BUY"/"SELL"; execution.Commission's positive magnitude
-         → negative=cost). See ``_SIDE_NORMALIZE_COLS`` /
-         ``_COMMISSION_SIGN_FLIP_COLS``.
+         → negative=cost), plus a sentinel scrub for the PnL columns that
+         carry IBKR's Double.MAX_VALUE "not yet computed" sentinel instead of
+         null (position_pnl/account_pnl's DailyPnl/UnrealizedPnl/RealizedPnl/
+         MarketValue). See ``_SIDE_NORMALIZE_COLS`` /
+         ``_COMMISSION_SIGN_FLIP_COLS`` / ``_PNL_SENTINEL_SCRUB_COLS``.
     2. If any renamed column needs a numeric cast (e.g. Multiplier → double),
        inspect the actual DataType via the table's meta_table and choose the
        correct Groovy expression: String→parseDouble, already-double→no-op,
@@ -256,6 +284,16 @@ def apply_canonical_view(
         # CONFIRMED 2026-07-15 against the live book (e.g. 0.048029, 0.022261,
         # 0.003 USD).
         value_exprs.append("Commission = isNull(Commission) ? Commission : -Commission")
+    # PnL sentinel scrub: IBKR's Double.MAX_VALUE "not yet computed" sentinel
+    # must become NULL_DOUBLE, never survive into a summed aggregate. Deephaven's
+    # NULL_DOUBLE is -Double.MAX_VALUE (a large NEGATIVE value), so it is never
+    # >= +Double.MAX_VALUE — a pre-existing null passes through this comparison
+    # untouched, with no isNull guard needed (see _PNL_SENTINEL_SCRUB_COLS above).
+    for col in schema.columns:
+        if (spec.schema_name, col.name) in _PNL_SENTINEL_SCRUB_COLS and col.name in renamed_cols:
+            value_exprs.append(
+                f"{col.name} = {col.name} >= 1.7976931348623157e308 ? NULL_DOUBLE : {col.name}"
+            )
     if value_exprs:
         tbl = tbl.update_view(value_exprs)
 

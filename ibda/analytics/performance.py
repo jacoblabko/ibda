@@ -315,7 +315,7 @@ def daily_returns(
     Returns:
         List of period returns, length ``len(nav_points) - 1``.
     """
-    return [r for _d, r in _dated_returns(nav, value_column=value_column, flows=flows)]
+    return [r for _pd, _d, r in _dated_returns(nav, value_column=value_column, flows=flows)]
 
 
 def _dated_returns(
@@ -323,22 +323,26 @@ def _dated_returns(
     *,
     value_column: str = "Total",
     flows: Mapping[date, float] | None = None,
-) -> list[tuple[date, float]]:
-    """Per-period returns paired with the date of the *later* NAV point.
+) -> list[tuple[date, date, float]]:
+    """Per-period returns paired with the *prior* and *later* NAV point's dates.
 
-    The shared primitive behind :func:`daily_returns` (which drops the dates) and the
-    benchmark date-alignment (which keys by date). ``r_t = (NAV_t - NAV_{t-1} - F_t) /
-    NAV_{t-1}``; periods whose prior NAV is 0 are skipped.
+    The shared primitive behind :func:`daily_returns` (which drops both dates) and the
+    benchmark date-alignment (which keys by the later date and also needs the prior
+    date, so a cross-series join can confirm both sides span the same period —
+    see :func:`ibda.analytics.benchmark._returns_by_date`). ``r_t = (NAV_t - NAV_{t-1}
+    - F_t) / NAV_{t-1}``; periods whose prior NAV is 0 are skipped. Each tuple is
+    ``(prior_date, later_date, return)``.
     """
     timestamps, values = _nav_series(nav, value_column)
-    out: list[tuple[date, float]] = []
+    out: list[tuple[date, date, float]] = []
     for i in range(1, len(values)):
         prev = values[i - 1]
         if prev == 0.0:
             continue
+        prior_date = timestamps[i - 1].date()
         d = timestamps[i].date()
         flow = flows.get(d, 0.0) if flows is not None else 0.0
-        out.append((d, (values[i] - prev - flow) / prev))
+        out.append((prior_date, d, (values[i] - prev - flow) / prev))
     return out
 
 

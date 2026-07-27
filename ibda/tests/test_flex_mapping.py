@@ -1048,3 +1048,120 @@ def test_arrow_table_from_rows_nulls_non_datetime_timestamp() -> None:
     timestamps = table.column("Timestamp").to_pylist()
     assert timestamps[0] is None, f"expected null for non-datetime Timestamp, got {timestamps[0]!r}"
     assert timestamps[1] is not None
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-24 review, FIX 2: blank Side / transfer-direction defaults are
+# silent — add WARNING guards (no behavior change).
+# ---------------------------------------------------------------------------
+
+
+def test_map_execution_blank_buy_sell_logs_warning_and_still_emits_empty_side(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A <Trade> missing/blank buySell logs a WARNING and still emits Side=='' unchanged."""
+    from ibda.adapters.ibkr.flex.mapping import _map_execution
+
+    trade: dict[str, Any] = {
+        "symbol": "AAPL",
+        "date_time": "2026-06-02 10:31:00",
+        "quantity": 100.0,
+        "trade_price": 150.0,
+        "buy_sell": None,
+        "exec_id": "e1",
+    }
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        result = _map_execution(trade)
+
+    assert result is not None
+    assert result["Side"] == "", "Side must remain '' — this test only checks visibility"
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("buySell" in m for m in warning_messages), (
+        f"expected a WARNING naming buySell; got: {warning_messages}"
+    )
+    assert any("AAPL" in m for m in warning_messages), (
+        f"expected the warning to name the symbol; got: {warning_messages}"
+    )
+
+
+def test_map_execution_normal_buy_sell_does_not_log_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A normal BUY/SELL trade must NOT emit the blank-buySell warning."""
+    from ibda.adapters.ibkr.flex.mapping import _map_execution
+
+    trade: dict[str, Any] = {
+        "symbol": "AAPL",
+        "date_time": "2026-06-02 10:31:00",
+        "quantity": 100.0,
+        "trade_price": 150.0,
+        "buy_sell": "BUY",
+        "exec_id": "e1",
+    }
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        result = _map_execution(trade)
+
+    assert result is not None
+    assert result["Side"] == "BUY"
+    buy_sell_warnings = [
+        r.message
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "buySell" in r.message
+    ]
+    assert not buy_sell_warnings, f"unexpected buySell WARNING: {buy_sell_warnings}"
+
+
+def test_map_transfer_absent_direction_logs_warning_and_still_defaults_to_in(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A transfer missing 'direction' logs a WARNING and still defaults to IN (+magnitude)."""
+    from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+    transfer: dict[str, Any] = {
+        "symbol": "GOOGL",
+        "date_time": "2026-06-02",
+        "direction": None,
+        "positionAmountInBase": 5000.0,
+    }
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        result = _map_transfer(transfer)
+
+    assert result is not None
+    assert result["Amount"] == 5000.0, "must still default to IN (+magnitude)"
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("direction" in m for m in warning_messages), (
+        f"expected a WARNING naming direction; got: {warning_messages}"
+    )
+    assert any("GOOGL" in m for m in warning_messages), (
+        f"expected the warning to name the symbol; got: {warning_messages}"
+    )
+
+
+def test_map_transfer_normal_in_out_does_not_log_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A transfer with an explicit IN or OUT direction must NOT emit the absent-direction warning."""
+    from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        in_result = _map_transfer({
+            "symbol": "GOOGL",
+            "date_time": "2026-06-02",
+            "direction": "IN",
+            "positionAmountInBase": 5000.0,
+        })
+        out_result = _map_transfer({
+            "symbol": "GOOGL",
+            "date_time": "2026-06-02",
+            "direction": "OUT",
+            "positionAmountInBase": 5000.0,
+        })
+
+    assert in_result is not None and in_result["Amount"] == 5000.0
+    assert out_result is not None and out_result["Amount"] == -5000.0
+    direction_warnings = [
+        r.message
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "direction" in r.message
+    ]
+    assert not direction_warnings, f"unexpected direction WARNING: {direction_warnings}"

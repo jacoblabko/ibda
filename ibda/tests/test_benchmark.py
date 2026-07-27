@@ -117,6 +117,73 @@ def test_relative_summary_drops_unmatched_dates() -> None:
     assert s.num_periods >= 2
 
 
+# --- interior-gap cross-series alignment (2026-07-24 fix) -------------------
+
+
+def test_aligned_returns_interior_gap_drops_mismatched_span() -> None:
+    """An INTERIOR benchmark gap must not pair mismatched-horizon returns.
+
+    Portfolio has NAV on Mon/Tue/Wed; benchmark is missing Tue. Portfolio's Wed
+    return spans Tue->Wed (1 day); benchmark's Wed return spans Mon->Wed (2 days,
+    the only NAV points it has). Both are keyed by the same later date (Wed), but
+    they must NOT be paired -- their prior dates disagree (Tue vs Mon). Pre-fix,
+    ``_aligned_returns`` joined purely on the later date and WOULD have paired them,
+    regressing a 1-day return against a 2-day return.
+    """
+    from ibda.analytics.benchmark import _aligned_returns
+
+    mon, tue, wed = (dt.date(2026, 1, 5), dt.date(2026, 1, 6), dt.date(2026, 1, 7))
+    nav = _nav_table([
+        {"Account": "U1",
+         "Timestamp": dt.datetime.combine(d, dt.time(0, tzinfo=dt.timezone.utc)),
+         "Total": v}
+        for d, v in [(mon, 100.0), (tue, 101.0), (wed, 102.0)]
+    ])
+    # benchmark skips Tue entirely
+    bench = _bar_table("QQQ", [(mon, 50.0), (wed, 53.0)])
+
+    common, rp, rb, _label, dropped = _aligned_returns(
+        nav, bench,
+        value_column="Total", benchmark_value_column="Close",
+        benchmark_range="1y", adjust_for_flows=True, supervisor=None,
+    )
+
+    # Wed is the only later date shared by both series, but its priors (Tue vs Mon)
+    # disagree, so it is dropped rather than paired.
+    assert wed not in common
+    assert common == []
+    assert rp == []
+    assert rb == []
+    # portfolio has 2 return-dates (Tue, Wed), benchmark has 1 (Wed); none aligned.
+    assert dropped == 3
+
+
+def test_aligned_returns_no_gap_matches_pre_fix_common_case() -> None:
+    """No calendar gaps: every overlapping date's prior also matches, so nothing new
+    is dropped and the aligned returns equal the direct per-series return formula --
+    the interior-gap fix must not change the common (gap-free) case."""
+    from ibda.analytics.benchmark import _aligned_returns
+
+    days = [dt.date(2026, 1, 5) + dt.timedelta(days=i) for i in range(6)]
+    nav = _nav_table([{"Account": "U1",
+                       "Timestamp": dt.datetime.combine(d, dt.time(0, tzinfo=dt.timezone.utc)),
+                       "Total": 100.0 + i} for i, d in enumerate(days)])
+    bench = _bar_table("QQQ", [(d, 50.0 + i) for i, d in enumerate(days)])
+
+    common, rp, rb, _label, dropped = _aligned_returns(
+        nav, bench,
+        value_column="Total", benchmark_value_column="Close",
+        benchmark_range="1y", adjust_for_flows=True, supervisor=None,
+    )
+
+    assert dropped == 0
+    assert common == days[1:]
+    expected_rp = [(100.0 + i - (100.0 + i - 1)) / (100.0 + i - 1) for i in range(1, 6)]
+    expected_rb = [(50.0 + i - (50.0 + i - 1)) / (50.0 + i - 1) for i in range(1, 6)]
+    assert rp == pytest.approx(expected_rp)
+    assert rb == pytest.approx(expected_rb)
+
+
 def test_relative_summary_symbol_requires_supervisor() -> None:
     """No offline fallback: a symbol benchmark with no supervisor is a clear ValueError."""
     days = [dt.date(2026, 1, 1) + dt.timedelta(days=i) for i in range(8)]
@@ -506,8 +573,8 @@ def test_aligned_returns_port_filters_cash_flows_by_account() -> None:
     mixed_flows = external_flows_from_cash(cash)
     u1_nav_only = _select_account(nav, "U1")
     mixed = _returns_by_date(u1_nav_only, "Total", mixed_flows)
-    assert mixed[days[1]] == pytest.approx(-0.01)
-    assert mixed[days[1]] != pytest.approx(rp_u1[0])
+    assert mixed[days[1]][1] == pytest.approx(-0.01)
+    assert mixed[days[1]][1] != pytest.approx(rp_u1[0])
 
 
 def test_relative_summary_port_filters_cash_flows_by_account() -> None:

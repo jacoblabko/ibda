@@ -32,9 +32,15 @@ _KNOWN_CONTAINERS = {
 def _to_float(v: str | None, field_name: str = "") -> float | None:
     """Convert a Flex attribute string to float, or None for absent/empty values.
 
-    Logs a WARNING (including the field name and raw value) when *v* is a
-    non-empty string that cannot be parsed as a float — distinguishing a genuine
-    parse failure from a legitimately absent field (None / "").
+    Returns ``None`` for a missing, blank, or unparseable numeric field — this
+    function never substitutes a default like 0.0. Logs a WARNING (including
+    the field name and raw value) when *v* is a non-empty string that cannot
+    be parsed as a float, distinguishing a genuine parse failure from a
+    legitimately absent field (None / ""); a missing/blank field returns
+    ``None`` silently. The caller (``mapping.py``) decides what a ``None``
+    means per field: some numeric columns (e.g. Commission, RealizedPnl) pass
+    it through as a nullable value, while others (e.g. Amount, Total, Price,
+    Qty) treat it as reason to drop the row.
 
     Parameters
     ----------
@@ -52,7 +58,7 @@ def _to_float(v: str | None, field_name: str = "") -> float | None:
     except ValueError:
         logger.warning(
             "_to_float: could not parse %r as float for field %r — returning None "
-            "(downstream mapping will substitute 0.0 for None numeric fields)",
+            "(mapping.py decides per-field whether None is kept as null or the row is dropped)",
             v,
             field_name,
         )
@@ -93,22 +99,75 @@ def parse_statement(xml: str) -> dict[str, Any]:
         status = "in_progress" if code == "1019" else "fail"
         return {"status": status, "code": code, "message": msg}
 
-    stmt = root.find(".//FlexStatement")
-    if stmt is None:
+    # A FlexQueryResponse can legitimately hold MORE THAN ONE <FlexStatement>
+    # element — per-account, advisor, family, or non-consolidated Flex queries
+    # report <FlexStatements count="N"> with N>1 sibling <FlexStatement>
+    # blocks. root.find(...) here previously kept only the first block, so
+    # every other statement's trades/cash/corporate-actions/pnl/nav rows were
+    # silently dropped (no error, no warning) — which also defeated the
+    # multi-account guard downstream in arrow.py (it derives the account set
+    # from the nav rows it is handed, so it only ever saw statement #1's
+    # account). Iterating and concatenating fixes this while staying
+    # identical for the common count="1" case: findall returns a single
+    # element there, so every _parse_* call runs exactly once, as before.
+    stmts = root.findall(".//FlexStatement")
+    if not stmts:
         return {"status": "error", "message": "no FlexStatement element found"}
 
-    sections = {
-        "trades": _parse_trades(stmt),
-        "cash": _parse_cash(stmt),
-        "corporate_actions": _parse_corporate_actions(stmt),
-        "pnl": _parse_pnl(stmt),
-        "nav": _parse_nav(stmt),
+    trades: list[dict[str, Any]] = []
+    cash: list[dict[str, Any]] = []
+    corporate_actions: list[dict[str, Any]] = []
+    nav: list[dict[str, Any]] = []
+    nav_changes: list[dict[str, Any]] = []
+    fifo_by_symbol: list[dict[str, Any]] = []
+    unparsed: list[str] = []
+    for stmt in stmts:
+        trades.extend(_parse_trades(stmt))
+        cash.extend(_parse_cash(stmt))
+        corporate_actions.extend(_parse_corporate_actions(stmt))
+        nav.extend(_parse_nav(stmt))
+        pnl = _parse_pnl(stmt)
+        if pnl["change_in_nav"]:
+            nav_changes.append(pnl["change_in_nav"])
+        fifo_by_symbol.extend(pnl["fifo_by_symbol"])
+        unparsed.extend(
+            child.tag for child in stmt
+            if child.tag not in _KNOWN_CONTAINERS and len(child) > 0
+        )
+
+    # change_in_nav is kept as a single dict (not a list) for backward
+    # compatibility: it is returned verbatim to downstream consumers that
+    # expect a dict shape and would break if this became a list. Each
+    # ChangeInNAV record now also carries its own "account" (see the
+    # nav_el.attrib block above), so the first-statement dict is no longer
+    # anonymous. For the common single-statement case this is the exact
+    # prior dict shape, just with an added "account" key.
+    #
+    # A genuinely multi-statement report has one ChangeInNAV record per
+    # statement/account; merging them into one dict would silently overwrite
+    # all but one. Rather than lose that data, change_in_nav_by_account below
+    # carries the FULL list (every statement's record, each labeled with its
+    # account) — the single dict stays first-statement-wins for callers that
+    # haven't been updated, while the new list is lossless for callers that
+    # need every account's NAV-change summary.
+    pnl_section: dict[str, Any] = {
+        "change_in_nav": nav_changes[0] if nav_changes else {},
+        "change_in_nav_by_account": nav_changes,
+        "fifo_by_symbol": fifo_by_symbol,
     }
-    unparsed = [
-        child.tag for child in stmt
-        if child.tag not in _KNOWN_CONTAINERS and len(child) > 0
-    ]
-    return {"status": "ok", "sections": sections, "unparsed_sections": unparsed}
+
+    sections = {
+        "trades": trades,
+        "cash": cash,
+        "corporate_actions": corporate_actions,
+        "pnl": pnl_section,
+        "nav": nav,
+    }
+    # De-dup unparsed tags across statements while preserving first-seen
+    # order (a tag unparsed in statement 1 would otherwise also be reported
+    # once per subsequent statement that has the same unhandled container).
+    unparsed_sections = list(dict.fromkeys(unparsed))
+    return {"status": "ok", "sections": sections, "unparsed_sections": unparsed_sections}
 
 
 def parse_statement_or_raise(xml: str) -> dict[str, Any]:
@@ -276,6 +335,10 @@ def _parse_corporate_actions(stmt: ET.Element) -> list[dict[str, Any]]:
             "positionAmountInBase": _to_float(a.get("positionAmountInBase"), "positionAmountInBase"),
             "transferPrice": _to_float(a.get("transferPrice"), "transferPrice"),
             "cashTransfer": _to_float(a.get("cashTransfer"), "cashTransfer"),
+            # IBKR's local->base conversion rate for this row: base = local * fxRateToBase.
+            # Previously dropped entirely, which is why a base-currency magnitude could be
+            # emitted under a local-currency label (see mapping._map_transfer).
+            "fxRateToBase": _to_float(a.get("fxRateToBase"), "fxRateToBase"),
             "currency": a.get("currency"),
             "account": a.get("accountId"),
         })
@@ -288,6 +351,7 @@ def _parse_pnl(stmt: ET.Element) -> dict[str, Any]:
     if nav_el is not None:
         a = nav_el.attrib
         nav = {
+            "account": a.get("accountId") or "",
             "from_date": a.get("fromDate"),
             "to_date": a.get("toDate"),
             "starting_value": _to_float(a.get("startingValue"), "startingValue"),

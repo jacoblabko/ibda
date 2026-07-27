@@ -222,10 +222,11 @@ def test_subscribe_atm_option_happy_path_returns_conid(
 
     def _fake_subscribe_option_greeks(
         supervisor: Any, symbol: str, expiry: Any, strike: float, right: str,
-        exchange: str = "SMART",
+        exchange: str = "SMART", trading_class: str | None = None,
     ) -> int:
         captured.update(
-            symbol=symbol, expiry=expiry, strike=strike, right=right, exchange=exchange
+            symbol=symbol, expiry=expiry, strike=strike, right=right,
+            exchange=exchange, trading_class=trading_class,
         )
         return 42
 
@@ -240,6 +241,10 @@ def test_subscribe_atm_option_happy_path_returns_conid(
     assert captured["strike"] == 100.0
     assert captured["right"] == "C"
     assert captured["exchange"] == "SMART"
+    # Fix D: the already-parsed OptionParams.trading_class ("AAPL", from _chain())
+    # must reach subscribe_option_greeks so it can disambiguate a multi-trading-class
+    # underlying instead of fanning out into >1 market-data line.
+    assert captured["trading_class"] == "AAPL"
 
 
 def test_subscribe_atm_option_never_raises_on_collaborator_exception(
@@ -270,7 +275,7 @@ def test_subscribe_atm_option_walks_to_second_candidate_when_first_fails(
 
     def _fake_subscribe_option_greeks(
         supervisor: Any, symbol: str, expiry: Any, strike: float, right: str,
-        exchange: str = "SMART",
+        exchange: str = "SMART", trading_class: str | None = None,
     ) -> int | None:
         attempts.append(strike)
         return None if strike == 100.0 else 77
@@ -293,7 +298,7 @@ def test_subscribe_atm_option_none_when_every_candidate_fails(
 
     def _always_fail(
         supervisor: Any, symbol: str, expiry: Any, strike: float, right: str,
-        exchange: str = "SMART",
+        exchange: str = "SMART", trading_class: str | None = None,
     ) -> int | None:
         attempts.append(strike)
         return None
@@ -318,7 +323,7 @@ def test_subscribe_atm_option_respects_max_strike_candidates(
 
     def _always_fail(
         supervisor: Any, symbol: str, expiry: Any, strike: float, right: str,
-        exchange: str = "SMART",
+        exchange: str = "SMART", trading_class: str | None = None,
     ) -> int | None:
         attempts.append(strike)
         return None

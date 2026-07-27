@@ -89,8 +89,10 @@ def load_flex_xml(xml: str) -> Any:
     -------
     ::
 
+        import pathlib
+
         import ibda
-        port = ibda.load_flex_xml(open("activity.xml").read())
+        port = ibda.load_flex_xml(pathlib.Path("activity.xml").read_text())
         arrow = port.table("execution").snapshot()
     """
     import ibda

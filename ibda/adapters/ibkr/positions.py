@@ -45,9 +45,11 @@ def _canonical_position_view(supervisor: IbkrSupervisor) -> Any:
     """Return the cached canonical ``position`` live view for *supervisor*.
 
     Built once per session via the deephaven adapter's ``apply_canonical_view``
-    over the raw ``accounts_positions`` table; cached keyed by the session's
-    ``id()``.  The engine import lives inside the lazily-imported view helper,
-    not here.
+    over the raw ``accounts_positions`` table; cached in a ``WeakKeyDictionary``
+    keyed by the session OBJECT itself (not ``id(session)`` — see the module
+    comment above ``_VIEW_CACHE``), so entries are evicted automatically when
+    the session is garbage-collected.  The engine import lives inside the
+    lazily-imported view helper, not here.
     """
     session = supervisor._session
     view = _VIEW_CACHE.get(session)

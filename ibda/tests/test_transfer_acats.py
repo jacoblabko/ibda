@@ -366,3 +366,164 @@ class TestTransferDateFallback:
         assert "markValue" not in transfers[0], (
             "markValue is not a valid Transfer field and must not appear in parsed output"
         )
+
+
+# ---------------------------------------------------------------------------
+# Multi-currency: Amount and Currency must describe the same thing
+# ---------------------------------------------------------------------------
+#
+# Invisible on this book — every fixture is USD, so base == local and the bug cannot
+# show up. These tests supply the cross-currency case directly.
+
+
+class TestTransferCurrencyConsistency:
+    """`positionAmountInBase` is a BASE-currency value; `Currency` is the LOCAL label."""
+
+    def test_base_magnitude_is_converted_back_to_the_local_currency(self) -> None:
+        """A 1,000 EUR transfer on a USD-base statement must not be emitted as 1,080 EUR."""
+        from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+        row = _map_transfer(
+            {
+                "symbol": "SAP",
+                "direction": "IN",
+                "positionAmountInBase": 1080.0,   # USD (base)
+                "fxRateToBase": 1.08,             # base = local * 1.08
+                "currency": "EUR",                # local label on the row
+                "date_time": "20260724;120000",
+            }
+        )
+        assert row is not None
+        assert row["Currency"] == "EUR"
+        assert row["Amount"] == pytest.approx(1000.0), (
+            "Amount must be expressed in the currency the row is labelled with"
+        )
+
+    def test_conversion_preserves_the_direction_sign(self) -> None:
+        from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+        row = _map_transfer(
+            {
+                "symbol": "SAP",
+                "direction": "OUT",
+                "positionAmountInBase": 1080.0,
+                "fxRateToBase": 1.08,
+                "currency": "EUR",
+                "date_time": "20260724;120000",
+            }
+        )
+        assert row is not None
+        assert row["Amount"] == pytest.approx(-1000.0)
+
+    def test_a_unit_rate_is_a_no_op(self) -> None:
+        """The all-USD case: base == local, conversion must change nothing."""
+        from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+        row = _map_transfer(
+            {
+                "symbol": "AAPL",
+                "direction": "IN",
+                "positionAmountInBase": 84000.0,
+                "fxRateToBase": 1.0,
+                "currency": "USD",
+                "date_time": "20260724;120000",
+            }
+        )
+        assert row is not None
+        assert row["Amount"] == pytest.approx(84000.0)
+        assert row["Currency"] == "USD"
+
+    def test_a_nonsensical_rate_falls_back_rather_than_dividing_by_zero(self) -> None:
+        """A zero/negative rate is bad data; it must not produce inf or flip the sign."""
+        from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+        for bad_rate in (0.0, -1.08):
+            row = _map_transfer(
+                {
+                    "symbol": "SAP",
+                    "direction": "IN",
+                    "positionAmountInBase": 1080.0,
+                    "fxRateToBase": bad_rate,
+                    "currency": "EUR",
+                    "date_time": "20260724;120000",
+                }
+            )
+            assert row is not None
+            assert row["Amount"] == pytest.approx(1080.0), (
+                f"rate {bad_rate} must fall back to the unconverted magnitude"
+            )
+
+    def test_missing_rate_warns_when_it_cannot_verify_the_label(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Absent a rate we cannot distinguish 'single-currency' from 'missing data'."""
+        from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+        with caplog.at_level(logging.WARNING):
+            row = _map_transfer(
+                {
+                    "symbol": "SAP",
+                    "direction": "IN",
+                    "positionAmountInBase": 1080.0,
+                    "currency": "EUR",
+                    "date_time": "20260724;120000",
+                }
+            )
+        assert row is not None
+        assert row["Amount"] == pytest.approx(1080.0), "behaviour preserved when no rate"
+        assert "no fxRateToBase" in caplog.text
+
+    def test_no_warning_when_a_local_amount_is_available_as_corroboration(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """positionAmount present means the local value is known; nothing to warn about."""
+        from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+        with caplog.at_level(logging.WARNING):
+            _map_transfer(
+                {
+                    "symbol": "AAPL",
+                    "direction": "IN",
+                    "positionAmountInBase": 84000.0,
+                    "positionAmount": 84000.0,
+                    "currency": "USD",
+                    "date_time": "20260724;120000",
+                }
+            )
+        assert "no fxRateToBase" not in caplog.text
+
+
+def test_parser_captures_fx_rate_to_base() -> None:
+    """It was dropped entirely, which is why the mislabel was unfixable downstream."""
+    xml = """<FlexQueryResponse><FlexStatements><FlexStatement>
+      <Transfers><Transfer symbol="SAP" direction="IN" quantity="10"
+        positionAmount="1000.00" positionAmountInBase="1080.00" fxRateToBase="1.08"
+        currency="EUR" dateTime="20260724;120000" accountId="U123"/></Transfers>
+    </FlexStatement></FlexStatements></FlexQueryResponse>"""
+
+    parsed = parse_statement(xml)
+    assert parsed["status"] == "ok"
+    # Transfers are parsed into the corporate_actions section (kind=="transfer").
+    transfers = [
+        r
+        for r in dict(parsed["sections"]).get("corporate_actions", [])
+        if r.get("kind") == "transfer"
+    ]
+    assert transfers, "expected the Transfer row to parse"
+    assert transfers[0]["fxRateToBase"] == pytest.approx(1.08)
+
+
+def test_end_to_end_a_eur_transfer_lands_as_eur_on_a_usd_base_statement() -> None:
+    """Through the real parse -> canonical path, not just the private mapper."""
+    xml = """<FlexQueryResponse><FlexStatements><FlexStatement>
+      <Transfers><Transfer symbol="SAP" direction="IN" quantity="10"
+        positionAmountInBase="1080.00" fxRateToBase="1.08"
+        currency="EUR" dateTime="20260724;120000" accountId="U123"/></Transfers>
+    </FlexStatement></FlexStatements></FlexQueryResponse>"""
+
+    parsed = parse_statement(xml)
+    canon = flex_sections_to_canonical(dict(parsed["sections"]))
+    rows = [r for r in canon["cash"] if r.get("Type") == "Transfer"]
+    assert len(rows) == 1
+    assert rows[0]["Currency"] == "EUR"
+    assert rows[0]["Amount"] == pytest.approx(1000.0)

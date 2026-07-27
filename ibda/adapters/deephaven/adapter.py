@@ -262,6 +262,7 @@ class DeephavenPort(DataPort):
             )
 
         from deephaven import agg
+        from deephaven.dherror import DHError  # noqa: PLC0415 — deephaven import, lazy
 
         # agg.sum_ / agg.avg / agg.last accept a list of column names.
         # agg.count_ is special: it takes a SINGLE STRING (the output column name),
@@ -277,7 +278,17 @@ class DeephavenPort(DataPort):
                 agg_list.append(agg.count_(col))  # plain string, not a list
             else:
                 agg_list.append(_list_fn[how]([col]))
-        handle = result.handle.agg_by(agg_list, by=list(by))  # type: ignore[attr-defined]
+        # Same mitigation as `filter`/`time_window`/`derive` above: the
+        # `unsupported`-function check and (upstream) query.validate() cover the
+        # common cases, but a key that names a column of the wrong dtype for its
+        # aggregation (e.g. sum on a STRING column) still reaches the engine and
+        # raises a raw `deephaven.DHError` — reraise as a port-level ValueError
+        # so it surfaces as the documented `invalid_query` at the MCP boundary
+        # instead of an uncaught traceback (group_by was the one op missing this).
+        try:
+            handle = result.handle.agg_by(agg_list, by=list(by))  # type: ignore[attr-defined]
+        except DHError as exc:
+            raise ValueError(f"invalid group_by aggs {dict(aggs)!r}: {exc}") from exc
         # group_by changes the column set — derive a Schema from the actual output
         # so result.schema.column_names is accurate and snapshot() validates correctly.
         derived = _schema_from_dh_handle(handle)

@@ -18,6 +18,16 @@ market data being substituted for a non-entitled real-time request — data is s
 delivered, just degraded). See the ``ErrorTier`` enum below for the full per-tier
 detail this module implements.
 
+This module is a deliberate second implementation of that rule. The canonical one
+lives in the vendored ``deephaven-ib`` fork (``_internal/error_tiers.py``), which
+``ibda`` may not import — the package boundary is one-way. A parity test holds the
+two to the same answers and requires any divergence to be declared.
+
+The one declared divergence is :attr:`ErrorTier.MARKET_DATA_WARNING`, a fourth tier
+splitting *delivered but degraded* out of the canonical three. It is a severity
+refinement only: every code in it is INFORMATIONAL to the canonical classifier, so
+the two never disagree about whether a request succeeded.
+
 Engine-free: no deephaven, no ibapi import. Pure stdlib only.
 """
 
@@ -61,19 +71,26 @@ class ErrorTier(enum.Enum):
     """
 
     MARKET_DATA_WARNING = "market_data_warning"
-    """Market-data subscription or entitlement notice — non-fatal.
+    """Market data was DELIVERED, but degraded — substituted or partial.
 
-    10000-band codes that indicate delayed, substituted, or unavailable market
-    data due to subscription tier. Examples:
+    The tier exists because "you got delayed data instead of real-time" deserves
+    more attention than a farm-status note (the canonical classifier calls both
+    INFORMATIONAL) without being a failure. The dividing line is **delivery**:
 
-    * 10167 — not subscribed; delayed data WILL follow (display continues).
-    * 10168 — market data farm is not delivering data (transient gap).
-    * 10197 — no data for contract (empty snapshot; not an API failure).
-    * 10089 — user data farm not connected (entitlement).
-    * 10091 — connectivity to exchange disrupted (entitlement / exchange issue).
+    * 10167 — "not subscribed. Displaying delayed market data" — delayed ticks
+      follow; the subscription silently stopped being real-time.
+    * 10091 — "Part of requested market data requires additional subscription…
+      Delayed market data is available" — partial, with a delayed fallback.
 
-    These are warnings, not errors: the request completed, just with degraded
-    or absent market data. Log at WARNING; don't abort.
+    Both carry an explicit delayed-data clause. That clause is the whole test:
+    a caller receiving one of these has data in hand and should keep going with
+    its provenance downgraded. Log at WARNING; don't abort.
+
+    Codes that deny the request outright — 10089, 10168, 10197 — are NOT here.
+    Nothing arrives for them, so they are :attr:`GENUINE_ERROR`; see
+    :func:`is_market_data_denied` for the per-contract distinction that matters
+    to a caller. Classifying a permanent denial as a non-fatal warning is what
+    produced the observed retry loops.
     """
 
     GENUINE_ERROR = "genuine_error"
@@ -83,6 +100,14 @@ class ErrorTier(enum.Enum):
     connected), 326 (duplicate client id), 200 (no security definition), 162
     (historical data error).  Log at ERROR; fail or retry as appropriate.  This
     is also the default for any unrecognised code.
+
+    **Scope: the request, not necessarily the session.** The market-data denials
+    (10089/10168/10197) live here because nothing was delivered, but they are
+    per-contract facts — the connection is healthy and other subscriptions are
+    unaffected. Tear a session down on :func:`is_connection_lost` /
+    :func:`is_connectivity_event`, never on "some error was GENUINE". And note
+    the denials are typically **permanent** for the account until a subscription
+    changes: retrying one on a timer is the observed failure mode, not the fix.
     """
 
 
@@ -114,17 +139,31 @@ _INFORMATIONAL_CODES: frozenset[int] = frozenset({2176})
 _SYSTEM_BAND_LO: int = 2100
 _SYSTEM_BAND_HI: int = 2169  # inclusive
 
-# Non-fatal market-data subscription warnings in the 10000-band.
-# Keep this set small and each entry documented:
-#   10167 — "not subscribed — displaying delayed market data"; delayed ticks follow
-#   10168 — "market data farm connection is not available" (transient gap in feed)
-#   10197 — "no data for contract" (empty snapshot; contract may be halted/inactive)
-#   10089 — "user data farm connection is not available" (entitlement gap)
-#   10091 — "Connectivity between TWS and server is broken" for market-data sub-system
+# Market data DELIVERED but degraded. Membership is decided by one question: did the
+# caller get ticks? Both of these say so in the message itself, in IB's own words:
+#   10167 — "Requested market data is not subscribed. Displaying delayed market data."
+#   10091 — "Part of requested market data requires additional subscription… Delayed
+#            market data is available."
+#
+# 10089/10168/10197 were in this set until 2026-07-27 and did not belong: each is a
+# refusal with nothing delivered, confirmed against a live account rather than inferred.
 _MARKET_DATA_WARNING_CODES: frozenset[int] = frozenset({
-    10089,
     10091,
     10167,
+})
+
+# Market data DENIED — the request returned nothing. These fall through to GENUINE_ERROR
+# (the request failed), and this set exists so a caller can tell a per-contract denial
+# from a connection failure without re-deriving the codes:
+#   10089 — "Requested market data requires additional subscription for API." Observed
+#           on liquid US equities every cycle under market_data_type 1 AND 3; no
+#           bid/ask ever arrived.
+#   10168 — "not subscribed. Delayed market data is not enabled" — the 10167 sibling with
+#           no fallback (observed 2026-06-26 on an index: "not entitled").
+#   10197 — "No market data during competing live session." IBKR admits one live
+#           market-data session per login; observed 158 times in a ~31s retry loop.
+_MARKET_DATA_DENIED_CODES: frozenset[int] = frozenset({
+    10089,
     10168,
     10197,
 })
@@ -167,6 +206,8 @@ def classify_error(code: int, message: str | None = None) -> ErrorTier:
     <ErrorTier.GENUINE_ERROR: 'genuine_error'>
     >>> classify_error(10167)
     <ErrorTier.MARKET_DATA_WARNING: 'market_data_warning'>
+    >>> classify_error(10089)
+    <ErrorTier.GENUINE_ERROR: 'genuine_error'>
     >>> classify_error(2176)
     <ErrorTier.INFORMATIONAL: 'informational'>
     """
@@ -189,11 +230,12 @@ def classify_error(code: int, message: str | None = None) -> ErrorTier:
             return ErrorTier.CONNECTIVITY_DEGRADED
         return ErrorTier.INFORMATIONAL
 
-    # 10000-band market-data subscription warnings.
+    # 10000-band notices that still DELIVERED data, just degraded.
     if code in _MARKET_DATA_WARNING_CODES:
         return ErrorTier.MARKET_DATA_WARNING
 
-    # Default: genuine error (low codes + anything unrecognised).
+    # Default: genuine error — low codes, the market-data denials
+    # (_MARKET_DATA_DENIED_CODES, which deliver nothing), and anything unrecognised.
     return ErrorTier.GENUINE_ERROR
 
 
@@ -205,7 +247,11 @@ def classify_error(code: int, message: str | None = None) -> ErrorTier:
 def is_fatal(code: int, message: str | None = None) -> bool:
     """Return True iff this code is a :attr:`~ErrorTier.GENUINE_ERROR`.
 
-    Use this to gate abort/retry logic.
+    Use this to gate **request-level** abort/retry: the call this code arrived on
+    did not succeed. It is not a session verdict — a market-data denial
+    (:func:`is_market_data_denied`) fails one contract while the connection stays
+    healthy. For connection teardown, branch on :func:`is_connection_lost` or
+    :func:`is_connectivity_event`.
 
     Parameters
     ----------
@@ -215,6 +261,25 @@ def is_fatal(code: int, message: str | None = None) -> bool:
         The ``errorString``; forwarded to :func:`classify_error`.
     """
     return classify_error(code, message) is ErrorTier.GENUINE_ERROR
+
+
+def is_market_data_denied(code: int) -> bool:
+    """Return True iff market data was REFUSED for this request — nothing delivered.
+
+    ``10089`` (subscription required), ``10168`` (not subscribed, no delayed
+    fallback) and ``10197`` (competing live session). All three are
+    :attr:`~ErrorTier.GENUINE_ERROR`; this predicate is how a caller tells "this
+    contract has no data on this account" from "the request was malformed" or "the
+    connection died", without re-deriving the code list.
+
+    Practical consequence, from live evidence: these are **persistent** — the same
+    contract returns the same denial on every cycle until an account subscription
+    changes (or, for 10197, until the competing session ends). A caller should stop
+    requesting that contract and surface the reason, not schedule a retry. Contrast
+    :func:`classify_error` ``is MARKET_DATA_WARNING`` (10167/10091), where ticks do
+    arrive and the right response is to carry on with degraded provenance.
+    """
+    return code in _MARKET_DATA_DENIED_CODES
 
 
 def is_connectivity_event(code: int) -> bool:
@@ -551,4 +616,5 @@ __all__ = [
     "is_connection_restored",
     "is_connectivity_event",
     "is_fatal",
+    "is_market_data_denied",
 ]

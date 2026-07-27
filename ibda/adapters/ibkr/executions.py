@@ -98,7 +98,10 @@ def snapshot_executions(supervisor: IbkrSupervisor) -> pa.Table:
     Builds the canonical execution live view once (cached per session), snapshots
     it to row dicts via the supervisor's injected snapshot helper, and projects the
     rows into a canonical ``EXECUTION`` Arrow table (``OrderId`` populated;
-    ``Commission``/``Liquidity`` null-filled as today).
+    ``Commission``/``RealizedPnl`` joined in from ``orders_exec_commission_report``
+    — see ``specs.py``'s ``join_table``/``join_cols`` for the "execution" spec;
+    only ``Liquidity`` remains null-filled, as there is no source for it anywhere
+    in deephaven-ib).
 
     Parameters
     ----------

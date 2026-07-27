@@ -10,6 +10,7 @@ from ibda.adapters.ibkr.diagnostics import (
     is_connection_restored,
     is_connectivity_event,
     is_fatal,
+    is_market_data_denied,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "is_connection_restored",
     "is_connectivity_event",
     "is_fatal",
+    "is_market_data_denied",
 ]

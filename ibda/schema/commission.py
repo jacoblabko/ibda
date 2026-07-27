@@ -54,7 +54,7 @@ COMMISSION = Schema(
         Column(
             "RealizedPnl",
             DType.FLOAT64,
-            doc="realized P&L attributed to this execution (0.0 on opening trades)",
+            doc="realized P&L attributed to this execution (null on opening trades, not 0.0)",
         ),
         Column(
             "Yield",

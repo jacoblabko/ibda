@@ -166,6 +166,28 @@ def test_group_by_count_uses_string_not_list() -> None:
     assert row["ConId"] == 1
 
 
+def test_group_by_type_invalid_agg_raises_valueerror_not_raw_engine_error() -> None:
+    """FIX 2 (query.py validate() gap + adapter defense-in-depth): summing a
+    non-numeric (String) column is grammar-valid-looking but type-invalid --
+    query.validate() now catches the common "unknown column" case, but a
+    real-but-wrong-dtype column (e.g. "Sym", a String, summed) still reaches
+    `agg_by` and must surface as a port-level ValueError, not a raw
+    `deephaven.DHError` -- mirroring `filter`/`time_window`/`derive`'s existing
+    mitigation, which `group_by` previously lacked."""
+    from deephaven.dherror import DHError  # noqa: PLC0415 — JVM-gated
+
+    port = _adapter()
+    position = port.table("position")
+
+    with pytest.raises(ValueError) as exc_info:
+        port.group_by(position, by=["ConId"], aggs={"Sym": "sum"})  # String column, sum
+
+    assert not isinstance(exc_info.value, DHError), (
+        "a raw deephaven.DHError leaked through group_by() instead of ValueError"
+    )
+    assert "Sym" in str(exc_info.value)
+
+
 def test_sort_ascending() -> None:
     """sort() with descending=False produces ascending order."""
     port = _adapter()

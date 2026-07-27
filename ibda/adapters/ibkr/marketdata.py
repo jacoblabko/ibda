@@ -530,6 +530,7 @@ def historical_bars(
     timeout_s: float = 15.0,
     poll_interval_s: float = 0.25,
     keep_up_to_date: bool = True,
+    bar_type: Any | None = None,
 ) -> pa.Table:
     """Resolve *symbol* and return its historical daily bars as a canonical ``bar`` table.
 
@@ -553,6 +554,13 @@ def historical_bars(
         ``"1 day"``, ``"1 hour"``, ``"1 min"``.  An unrecognised string causes a
         ``ValueError`` from the enum reverse-lookup; it is caught by the best-effort
         handler and an empty bar table is returned.
+    bar_type:
+        Optional ``deephaven_ib.BarDataType``.  Defaults to ``TRADES``, which is correct
+        for equities but **not** for every instrument: IB serves no trade prints for an FX
+        ``CASH`` contract, so a TRADES request there returns nothing at all.  Callers
+        passing a non-equity ``contract`` should pass a matching type (``MIDPOINT`` for FX).
+        Kept as ``None``-defaulted rather than a literal default so the enum is not imported
+        at signature-evaluation time.
     contract:
         Optional pre-built ``Contract`` to resolve instead of a US-stock lookup built
         from *symbol* (e.g. an FX ``CASH``/IDEALPRO contract from
@@ -616,7 +624,7 @@ def historical_bars(
         bar_size_obj = dhib.BarSize(bar_size)
         requests = session.request_bars_historical(
             rc, duration=dur_obj, bar_size=bar_size_obj,
-            bar_type=dhib.BarDataType.TRADES,
+            bar_type=bar_type if bar_type is not None else dhib.BarDataType.TRADES,
             market_data_type=dhib.MarketDataType.FROZEN,
             keep_up_to_date=keep_up_to_date,
         )
@@ -700,8 +708,11 @@ def request_intraday_bars(
 ) -> dict[str, int]:
     """Register (cached) + issue request_bars_historical per symbol; return {symbol: request_id}.
 
-    The intraday per-cycle counterpart to ``historical_bars`` (which is a
-    one-shot daily benchmark fetch filtered by ContractId).  This issues a
+    The intraday per-cycle counterpart to ``historical_bars`` (which defaults
+    ``keep_up_to_date=True`` — a persistent, continuously-updating subscription,
+    not a one-shot fetch — and polls filtered by ``RequestId``, ANDed with
+    ``ContractId`` only as a belt-and-suspenders cross-check; see that
+    function's own docstring for the todo #31 fix).  This issues a
     ``request_bars_historical`` per symbol covering the last *duration_secs*
     seconds and returns each symbol's integer ``request_id`` so the caller can
     later read the shared ``bars_historical`` table filtered **by RequestId**

@@ -82,9 +82,9 @@ EXECUTION = Schema(
             DType.FLOAT64,
             doc=(
                 "IBKR's own broker-computed realized P&L for this fill, joined "
-                "from the commissionReport callback (0.0 on opening trades that "
-                "have no realized P&L yet). Null under the same unmatched-ExecId "
-                "condition as Commission."
+                "from the commissionReport callback (null on opening trades that "
+                "have no realized P&L yet — not 0.0). Also null under the same "
+                "unmatched-ExecId condition as Commission."
             ),
         ),
     ),

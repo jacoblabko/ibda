@@ -130,6 +130,16 @@ def _map_execution(trade: dict[str, Any]) -> dict[str, Any] | None:
         )
         return None
 
+    buy_sell: str = trade.get("buy_sell") or ""
+    if not buy_sell:
+        logger.warning(
+            "_map_execution: buySell absent/blank for %s (ExecId=%r) — emitting "
+            "Side='' rather than fabricating BUY/SELL; downstream consumers that "
+            "assume BUY/SELL should treat an empty Side as unknown direction",
+            symbol,
+            trade.get("exec_id"),
+        )
+
     # ExecId: prefer ibExecID > tradeID > synthetic
     exec_id: str = trade.get("exec_id") or ""
     if not exec_id:
@@ -193,7 +203,7 @@ def _map_execution(trade: dict[str, Any]) -> dict[str, Any] | None:
         "OrderId": order_id,
         "Sym": symbol,
         "SecType": sec_type,
-        "Side": trade.get("buy_sell") or "",
+        "Side": buy_sell,
         "Qty": qty_abs,
         "Price": float(trade_price),
         "Multiplier": multiplier,
@@ -279,6 +289,18 @@ def _map_transfer(t: dict[str, Any]) -> dict[str, Any] | None:
     3. ``quantity * transferPrice`` — computed when both are present
     4. ``cashTransfer`` — explicit cash transfer amount
 
+    **Currency consistency.** The emitted row carries ``Amount`` and ``Currency`` together,
+    so they must describe the same thing. Source 1 is in the *base* currency while
+    ``Currency`` is the row's *local* currency — on a multi-currency statement that
+    combination is simply wrong (a 1,000 EUR transfer emitted as ``Amount=1080,
+    Currency="EUR"`` when base is USD). Where IBKR supplies ``fxRateToBase`` we convert the
+    base magnitude back to local (``local = base / fxRateToBase``) so the pair agrees.
+
+    Where it is absent we cannot tell "single-currency account, rate is 1" from "missing
+    rate on a cross-currency row", so the base value is used as-is — preserving existing
+    behaviour — and a warning is logged naming the risk. On an all-USD book (every fixture
+    today) base == local and nothing changes either way.
+
     The sign follows ``direction``:
     * ``"IN"`` (or absent/unknown) → +magnitude (asset received)
     * ``"OUT"`` → -magnitude (asset sent)
@@ -291,11 +313,26 @@ def _map_transfer(t: dict[str, Any]) -> dict[str, Any] | None:
     transfer_price: float | None = t.get("transferPrice")
     quantity: float | None = t.get("quantity")
     cash_transfer: float | None = t.get("cashTransfer")
+    fx_rate_to_base: float | None = t.get("fxRateToBase")
 
     # Determine magnitude from first available source.
     magnitude: float | None = None
     if position_amount_in_base is not None:
-        magnitude = abs(position_amount_in_base)
+        # Source is base-currency; the row is labelled with the LOCAL currency. Convert so
+        # Amount and Currency agree. base = local * fxRateToBase, hence local = base / rate.
+        if fx_rate_to_base is not None and fx_rate_to_base > 0.0:
+            magnitude = abs(position_amount_in_base) / fx_rate_to_base
+        else:
+            magnitude = abs(position_amount_in_base)
+            if position_amount is None:
+                logger.warning(
+                    "_map_transfer: using positionAmountInBase (base currency) for %s but "
+                    "no fxRateToBase is present — emitting it under the local currency "
+                    "label %r. Correct only if this account's base currency IS %s.",
+                    t.get("symbol") or "<unknown>",
+                    t.get("currency"),
+                    t.get("currency"),
+                )
     elif position_amount is not None:
         magnitude = abs(position_amount)
     elif quantity is not None and transfer_price is not None:
@@ -306,7 +343,15 @@ def _map_transfer(t: dict[str, Any]) -> dict[str, Any] | None:
     if magnitude is None:
         return None
 
-    direction: str = (t.get("direction") or "IN").strip().upper()
+    direction_raw: str = t.get("direction") or ""
+    if not direction_raw.strip():
+        logger.warning(
+            "_map_transfer: direction absent/blank for %s — defaulting to IN "
+            "(+magnitude); a genuine OUT transfer missing this attribute would "
+            "silently be treated as an inflow",
+            t.get("symbol") or "<unknown>",
+        )
+    direction: str = (direction_raw or "IN").strip().upper()
     signed_amount: float = magnitude if direction != "OUT" else -magnitude
 
     account_raw: str | None = t.get("account")

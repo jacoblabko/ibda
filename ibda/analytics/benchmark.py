@@ -269,11 +269,17 @@ def _returns_by_date(
     table: pa.Table,
     value_column: str,
     flows: Mapping[date, float] | None = None,
-) -> dict[date, float]:
-    """Per-date daily returns from a price/NAV table (keyed by the later date).
+) -> dict[date, tuple[date, float]]:
+    """Per-date daily returns from a price/NAV table, keyed by the later date and
+    carrying the prior date alongside the return: ``later_date -> (prior_date, return)``.
 
     Thin wrapper over :func:`performance._dated_returns` — the same primitive
     :func:`performance.daily_returns` uses — so the return formula lives in one place.
+    The prior date is carried through (rather than dropped) so :func:`_aligned_returns`
+    can confirm, before pairing two series' returns on a shared later date, that both
+    returns actually span the same period — an interior calendar gap in one series
+    would otherwise cause a 1-day return to be joined against a 2-day return from the
+    other series purely because their later dates coincide.
 
     Raises:
         ValueError: two rows produce the same return date. This is not a normal
@@ -282,8 +288,8 @@ def _returns_by_date(
             multiple rows per calendar date), so it is rejected rather than
             silently collapsed by last-value-wins.
     """
-    out: dict[date, float] = {}
-    for d, r in _dated_returns(table, value_column=value_column, flows=flows):
+    out: dict[date, tuple[date, float]] = {}
+    for prior_date, d, r in _dated_returns(table, value_column=value_column, flows=flows):
         if d in out:
             raise ValueError(
                 f"duplicate return date {d.isoformat()} — ambiguous input (e.g. an "
@@ -291,7 +297,7 @@ def _returns_by_date(
                 "pass account=... to relative_summary/rolling_relative to disambiguate, "
                 "or ensure the source has exactly one row per calendar date."
             )
-        out[d] = r
+        out[d] = (prior_date, r)
     return out
 
 
@@ -309,8 +315,15 @@ def _aligned_returns(
     """Resolve portfolio + benchmark to date-aligned daily returns.
 
     Returns ``(common_dates, portfolio_returns, benchmark_returns, label, dropped)`` where
-    returns are computed per series then inner-joined on calendar date (a gap never fabricates
-    a multi-day return). ``dropped`` is the count of per-series return-dates with no match.
+    returns are computed per series then inner-joined on calendar date. A date is only
+    paired across series when its *prior* return-date also matches — so a return whose
+    period is a single day (e.g. Tue -> Wed) is never paired against a return from the
+    other series covering multiple days (e.g. Mon -> Wed, because that series was missing
+    Tue). An interior gap in one series therefore drops that later date's observation
+    entirely rather than joining mismatched spans; a gap never fabricates a multi-day
+    return, and it never gets silently regressed against one either. ``dropped`` is the
+    count of per-series return-dates with no aligned match (including dates present in
+    both series but discarded because their prior dates disagree).
 
     Raises:
         ValueError: see :func:`_select_account` (multi-account NAV with no *account*
@@ -369,9 +382,13 @@ def _aligned_returns(
 
     p_by_date = _returns_by_date(nav_table, value_column, flows)
     b_by_date = _returns_by_date(bench_table, benchmark_value_column)
-    common = sorted(set(p_by_date) & set(b_by_date))
-    rp = [p_by_date[d] for d in common]
-    rb = [b_by_date[d] for d in common]
+    # Pair on the later date only when the prior date also matches -- otherwise the
+    # two series' returns for that date span different periods (see docstring above).
+    common = sorted(
+        d for d in (set(p_by_date) & set(b_by_date)) if p_by_date[d][0] == b_by_date[d][0]
+    )
+    rp = [p_by_date[d][1] for d in common]
+    rb = [b_by_date[d][1] for d in common]
     dropped = (len(p_by_date) - len(common)) + (len(b_by_date) - len(common))
     return common, rp, rb, label, dropped
 
@@ -421,8 +438,11 @@ def relative_summary(
             no *account* given is rejected rather than silently mixed together (see
             the ``ValueError`` below).
 
-    Returns are computed per series then inner-joined on calendar date, so a gap never
-    fabricates a multi-day return; unmatched dates are counted in ``dropped_periods``.
+    Returns are computed per series then inner-joined on calendar date, requiring both
+    the later AND prior date to match — so a gap never fabricates a multi-day return,
+    and an interior gap in one series never gets paired against a mismatched-span
+    return from the other; unmatched dates are counted in ``dropped_periods`` (see
+    :func:`_aligned_returns`).
 
     Returns:
         A :class:`RelativeSummary`.

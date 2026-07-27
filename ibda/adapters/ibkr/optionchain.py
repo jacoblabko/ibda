@@ -101,10 +101,14 @@ def option_chain(
     ``OptionChain``
         On success: fully parsed chain with ``by_exchange`` and ``smart`` populated.
     ``dict``
-        On failure (never raises): ``{"error": "symbol_not_found"|"request_failed"|
+        On the three guarded failure modes: ``{"error": "symbol_not_found"|"request_failed"|
         "chain_timeout", "symbol": ..., "message": ...}``.  This mirrors the
         structured-error contract that ``snapshot_quote`` uses in marketdata.py —
         callers can distinguish unresolved symbols, request failures, and timeouts.
+        Only ``get_registered_contract`` and ``request_sec_def_opt_params`` are
+        wrapped in try/except; the poll loop's ``snapshot_raw_rows_where`` call is
+        unguarded, so a non-``is_failed`` exception from the engine still
+        propagates to the caller — this function does not, in fact, never raise.
 
     Parameters
     ----------
@@ -200,14 +204,16 @@ def subscribe_option_greeks(
     strike: float,
     right: str,
     exchange: str = "SMART",
+    trading_class: str | None = None,
 ) -> int | None:
     """Subscribe Greeks for ONE option contract (bounded, on-demand).
 
     Builds the OPT contract, resolves it, and issues a single request_market_data so
     tickOptionComputation flows into the existing ``ticks_option_computation`` table.
     Returns the contract id (read it back via latest_option_greeks), or None if the
-    contract cannot be resolved. NO bulk "subscribe whole chain" path exists — that
-    would be the bloat trap. Live verification is entitlement-gated (paper → 10089).
+    contract cannot be resolved (or is ambiguous — see ``trading_class`` below). NO
+    bulk "subscribe whole chain" path exists — that would be the bloat trap. Live
+    verification is entitlement-gated (paper → 10089).
 
     Parameters
     ----------
@@ -223,13 +229,39 @@ def subscribe_option_greeks(
         "C" for call, "P" for put.
     exchange:
         Routing exchange (default "SMART").
+    trading_class:
+        Optional trading-class disambiguator (typically an already-parsed
+        ``OptionParams.trading_class`` from ``option_chain``). Some underlyings
+        register to MORE THAN ONE ``ContractDetails`` when this is omitted — e.g.
+        SPY's SMART chain resolves to both ``'2SPY'`` and ``'SPY'`` — and
+        deephaven-ib's ``request_market_data`` issues one ``reqMktData`` PER
+        ``ContractDetails`` on the registered contract (its own docstring:
+        "Registered contracts that are associated with multiple contract details
+        produce multiple requests"), so an under-specified contract silently spends
+        more than one market-data line for what looks like one subscription. Passing
+        ``trading_class`` lets IBKR collapse the resolution to a single
+        ``ContractDetails``.
     """
     session = supervisor._session
-    contract = build_option_contract(symbol, expiry, strike, right, exchange=exchange)
+    contract = build_option_contract(
+        symbol, expiry, strike, right, exchange=exchange, trading_class=trading_class
+    )
     try:
         rc = session.get_registered_contract(contract)
     except Exception as exc:  # noqa: BLE001
         logger.info("subscribe_option_greeks: %s not resolved: %s", symbol, exc)
+        return None
+    if rc.is_multi():
+        # Mirrors marketdata.py's request_intraday_bars guard (`if rc.is_multi():
+        # ... continue`): even with trading_class supplied (or when the caller had
+        # none to give), the contract can still be ambiguous. Skip rather than let
+        # request_market_data fan out into N reqMktData calls / N market-data lines
+        # for what the caller budgeted as one subscription.
+        logger.warning(
+            "subscribe_option_greeks: skipping multi-contract option %s "
+            "(expiry=%s strike=%s right=%s trading_class=%r) — ambiguous ContractDetails",
+            symbol, expiry, strike, right, trading_class,
+        )
         return None
     conid = _conid_of(rc)
     if conid is None:
@@ -398,11 +430,22 @@ def subscribe_atm_option(
 ) -> int | None:
     """Subscribe the nearest-expiry (>= ``min_dte``), at-the-money option and return its conId.
 
-    Costs AT MOST one market-data line — never more than one contract ever reaches
-    ``request_market_data``. Uses the ATM CALL by default — a call+put straddle would
-    double the line cost, which risks blowing a market-data-line quota (observed
-    2026-06-26: repeated restarts each re-subscribing without releasing prior lines
-    exhausted the account's market-data-line allotment).
+    **This is NOT a hard "at most one market-data line" guarantee** — that claim was
+    live-verified false on 2026-07-16: SPY resolves to 2 ``ContractDetails`` on SMART
+    and spent 2 lines on one ``request_market_data`` call before this fix. Two
+    mitigations are in place: (1) the already-parsed ``OptionParams.trading_class``
+    is now passed through to ``subscribe_option_greeks``, letting IBKR collapse a
+    multi-trading-class underlying like SPY to a single ``ContractDetails``; (2)
+    ``subscribe_option_greeks`` guards with ``rc.is_multi()`` (mirroring
+    ``marketdata.py``'s ``request_intraday_bars``) and skips — spending zero lines —
+    a contract still ambiguous after that. What is NOT fully closed: if
+    ``request_market_data`` itself raises AFTER a successful (non-ambiguous)
+    resolution, the candidate loop below still advances to the next strike, so the
+    true worst case across one call remains bounded by ``max_strike_candidates``, not
+    a hard 1. Uses the ATM CALL by default — a call+put straddle would double the
+    line cost, which risks blowing a market-data-line quota (observed 2026-06-26:
+    repeated restarts each re-subscribing without releasing prior lines exhausted
+    the account's market-data-line allotment).
 
     Composes the existing bounded primitives: ``option_chain`` (one-shot chain
     discovery) -> ``nearest_expiry`` (prefers a standard monthly) /
@@ -492,7 +535,8 @@ def subscribe_atm_option(
             return None
         for strike in candidates:
             con_id = subscribe_option_greeks(
-                supervisor, symbol, expiry, strike, right, exchange=exchange
+                supervisor, symbol, expiry, strike, right, exchange=exchange,
+                trading_class=params.trading_class,
             )
             if con_id is not None:
                 return con_id
