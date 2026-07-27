@@ -1,7 +1,7 @@
 # ibda
 
 `ibda` is a read-only data-access layer over an Interactive Brokers account. It turns the raw
-TWS API — asynchronous callbacks, no tables — plus `deephaven-ib`'s 34 append-only event tables
+TWS API — asynchronous callbacks, no tables — plus `deephaven-ib`'s 37 append-only event tables
 into **19 canonical, typed, current-state tables** (`position`, `execution`, `nav`, `quote`, ...),
 materialized as `pyarrow.Table`. The same query surface works from a live TWS connection or
 offline from a Flex Activity XML statement. For a quant or developer who already has an IBKR
