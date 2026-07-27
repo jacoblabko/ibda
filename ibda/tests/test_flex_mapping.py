@@ -1051,8 +1051,8 @@ def test_arrow_table_from_rows_nulls_non_datetime_timestamp() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2026-07-24 review, FIX 2: blank Side / transfer-direction defaults are
-# silent — add WARNING guards (no behavior change).
+# Blank Side / transfer-direction defaults are silent — WARNING guards
+# make them visible (no behavior change).
 # ---------------------------------------------------------------------------
 
 

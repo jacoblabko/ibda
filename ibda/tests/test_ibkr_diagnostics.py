@@ -109,8 +109,8 @@ class TestClassifyErrorMarketDataWarning:
     def test_denials_are_genuine_errors_not_warnings(self, code: int) -> None:
         """Nothing is delivered for these — the request failed.
 
-        Until 2026-07-27 they sat in MARKET_DATA_WARNING under a docstring promising
-        "the request completed". It had not: 10089 returned no bid/ask on every cycle
+        These are easy to file under MARKET_DATA_WARNING on the theory that "the
+        request completed". It had not: 10089 returned no bid/ask on every cycle
         under market_data_type 1 AND 3, and 10197 ran a ~31s retry loop 158 times
         against a competing-session wall.
         """

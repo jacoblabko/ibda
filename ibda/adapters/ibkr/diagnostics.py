@@ -145,8 +145,8 @@ _SYSTEM_BAND_HI: int = 2169  # inclusive
 #   10091 — "Part of requested market data requires additional subscription… Delayed
 #            market data is available."
 #
-# 10089/10168/10197 were in this set until 2026-07-27 and did not belong: each is a
-# refusal with nothing delivered, confirmed against a live account rather than inferred.
+# 10089/10168/10197 deliberately do NOT belong here: each is a refusal with nothing
+# delivered, confirmed against a live account rather than inferred.
 _MARKET_DATA_WARNING_CODES: frozenset[int] = frozenset({
     10091,
     10167,

@@ -117,7 +117,7 @@ def test_relative_summary_drops_unmatched_dates() -> None:
     assert s.num_periods >= 2
 
 
-# --- interior-gap cross-series alignment (2026-07-24 fix) -------------------
+# --- interior-gap cross-series alignment -----------------------------------
 
 
 def test_aligned_returns_interior_gap_drops_mismatched_span() -> None:
