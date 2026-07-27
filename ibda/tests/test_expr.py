@@ -1,7 +1,7 @@
 """Adversarial security suite for ibda.analytics.expr — the safe-DSL gate.
 
-This is the security boundary for DataPort.derive. The trust model behind it (decided
-2026-07-08) is: a caller-supplied ``derive`` expression may only be built from this
+This is the security boundary for DataPort.derive. The trust model behind it is:
+a caller-supplied ``derive`` expression may only be built from this
 module's restricted, whitelisted expression grammar — never arbitrary Groovy/Java handed
 to the engine. Every rejection case here is load-bearing: weakening this suite weakens the
 only thing standing between an MCP/LLM caller and a Groovy-formula RCE surface into the

@@ -5,7 +5,7 @@ Pure round-trip reconstruction over a fill ledger. No IO, no engine, no TWS (sam
 purity contract as ibda/analytics/performance.py). A round-trip is a flat->open->
 flat cycle for one symbol. Realized P&L is taken from each fill's IBKR-authoritative
 fifoPnlRealized (Fill.realized_pnl); we group and bucket, we do not recompute lot P&L.
-This grouping/bucketing rule was specified as a standalone design (dated 2026-07-01) before
+This grouping/bucketing rule was specified as a standalone design before
 implementation; the docstrings in this module are the complete, current statement of that
 contract.
 

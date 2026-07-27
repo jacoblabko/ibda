@@ -6,7 +6,7 @@ reports the per-currency ledger under ``$LEDGER-``-prefixed ``Key`` values
 per (Account, Currency) pair — distinct from the account-level summary keys
 the canonical ``account`` table pivots (those never carry more than one row
 and have no ``Currency`` dimension; verified live against a real IBKR paper
-session on 2026-07-06).
+session).
 
 Built by ``ibda.adapters.deephaven.views.build_cash_balance_view`` (a
 hand-written key-value pivot, not a plain ``apply_canonical_view`` rename —

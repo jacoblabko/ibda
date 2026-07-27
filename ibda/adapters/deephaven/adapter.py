@@ -182,7 +182,7 @@ class DeephavenPort(DataPort):
         registered-derived (custom-lambda) names resolve identically, and
         ``UnknownTable`` still guards a typo'd name.
 
-        This escape hatch was a deliberate, considered design decision (dated 2026-07-08),
+        This escape hatch was a deliberate, considered design decision,
         not an oversight: it deliberately reintroduces engine visibility for in-process
         callers, in exchange for table algebra the validated ``DataPort`` op set cannot
         express, while every out-of-process consumer keeps the engine fully hidden.

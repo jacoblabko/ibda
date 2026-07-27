@@ -72,7 +72,7 @@ _STRING_TO_DOUBLE_COLS: set[tuple[str, str]] = {
 #   the Flex mapper already emits (ibda.adapters.ibkr.flex.mapping._map_execution
 #   passes through Flex's buySell attribute, which IS "BUY"/"SELL"). Normalized
 #   here so both producers of the canonical `execution` table agree.
-#   CONFIRMED 2026-07-15 against the live book: raw execDetails.side arrives as
+#   CONFIRMED against the live book: raw execDetails.side arrives as
 #   "BOT"/"SLD" (see the comment on the expression below).
 #
 # ("execution", "Commission") / ("commission", "Commission"): commissionReport.
@@ -85,7 +85,7 @@ _STRING_TO_DOUBLE_COLS: set[tuple[str, str]] = {
 #   commission.Commission via the RAW commission table directly as its own
 #   raw_table — so this is two single negations of the same raw positive
 #   value, not a chained double-flip of one canonical output onto the other.
-#   CONFIRMED 2026-07-15 against the live book: raw commissionReport.commission
+#   CONFIRMED against the live book: raw commissionReport.commission
 #   arrives as a positive magnitude (e.g. 0.048029, 0.022261, 0.003 USD).
 _SIDE_NORMALIZE_COLS: set[tuple[str, str]] = {("execution", "Side")}
 _COMMISSION_SIGN_FLIP_COLS: set[tuple[str, str]] = {
@@ -270,8 +270,7 @@ def apply_canonical_view(
     # _COMMISSION_SIGN_FLIP_COLS module-level comments for the "why".
     value_exprs: list[str] = []
     if (spec.schema_name, "Side") in _SIDE_NORMALIZE_COLS and "Side" in renamed_cols:
-        # IB execDetails.side is BOT/SLD — CONFIRMED 2026-07-15 against the
-        # live book.
+        # IB execDetails.side is BOT/SLD — CONFIRMED against the live book.
         value_exprs.append(
             'Side = isNull(Side) ? Side : '
             '(Side.equals("BOT") ? "BUY" : (Side.equals("SLD") ? "SELL" : Side))'
@@ -281,8 +280,7 @@ def apply_canonical_view(
         and "Commission" in renamed_cols
     ):
         # live commissionReport.commission is a positive magnitude —
-        # CONFIRMED 2026-07-15 against the live book (e.g. 0.048029, 0.022261,
-        # 0.003 USD).
+        # CONFIRMED against the live book (e.g. 0.048029, 0.022261, 0.003 USD).
         value_exprs.append("Commission = isNull(Commission) ? Commission : -Commission")
     # PnL sentinel scrub: IBKR's Double.MAX_VALUE "not yet computed" sentinel
     # must become NULL_DOUBLE, never survive into a summed aggregate. Deephaven's
@@ -440,7 +438,7 @@ _ACCOUNT_METRIC_KEYS: dict[str, str] = {
 
 # Per-currency ledger tags on accounts_overview. IBKR reports these under
 # "$LEDGER-"-prefixed Key values (verified live against a real IBKR paper
-# session on 2026-07-06); the unprefixed keys above are the account-level,
+# session); the unprefixed keys above are the account-level,
 # single-currency summary and never carry more than one row / a Currency
 # dimension.
 _CASH_BALANCE_LEDGER_KEYS: dict[str, str] = {
@@ -615,7 +613,7 @@ def snapshot_rows_where(raw_table: Any, predicate: str) -> list[dict[str, Any]]:
 
     Failed-source guard: a shared streaming source (notably ``bars_historical``)
     can transition to a permanent Deephaven engine "failed" state mid-session
-    (first observed 2026-07-14, against a live session). Once failed, every
+    (observed against a live session). Once failed, every
     ``.where()`` against it raises ``deephaven.dherror.DHError`` for the rest of
     the process. Callers such as intraday P&L recompute this on a ~10s cycle, so
     left unguarded the error repeats forever. We pre-check ``raw_table.is_failed``

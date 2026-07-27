@@ -362,7 +362,7 @@ def _aligned_returns(
         # invocation was opening a fresh, never-released reqHistoricalData subscription,
         # accumulating toward IBKR's ~50-concurrent-historical cap.
         # False is safe here and strictly better: it returns the SAME rows (measured
-        # live on 2026-07-09 — see historical_bars' docstring for the trial detail),
+        # live — see historical_bars' docstring for the trial detail),
         # and since the fetch happens per call, "frozen at fetch time" is exactly as
         # fresh as the analytic that requested it.
         bench_table = historical_bars(

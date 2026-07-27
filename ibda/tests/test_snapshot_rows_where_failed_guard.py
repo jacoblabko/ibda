@@ -1,8 +1,8 @@
 """Pure tests for the ``snapshot_rows_where`` failed-source guard — no JVM.
 
 Covers the robustness fix for the permanent "failed" engine state a shared
-streaming source (notably ``bars_historical``) can enter mid-session (first
-observed 2026-07-14, against a live session). Once failed, every
+streaming source (notably ``bars_historical``) can enter mid-session (observed
+against a live session). Once failed, every
 ``raw_table.where(predicate)`` call would otherwise raise
 ``deephaven.dherror.DHError`` forever; ``snapshot_rows_where`` must pre-check
 ``is_failed`` and return ``[]`` without calling ``.where``.

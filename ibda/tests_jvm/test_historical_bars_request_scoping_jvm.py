@@ -1,6 +1,6 @@
 """JVM regression test for historical_bars's RequestId scoping.
 
-Proves the exact live defect first observed 2026-07-09 against a real
+Proves the exact live defect, observed against a real
 Deephaven server: deephaven-ib's ``bars_historical`` table is SHARED across every
 ``request_bars_historical`` call for the life of a session, so a poll filtered by
 ``ContractId`` ALONE unions in bars from any other duration/bar_size request
@@ -135,7 +135,7 @@ def test_historical_bars_scopes_to_own_request_id_not_union(
     assert session.requested_kwargs["duration"].value == "1 D"
     assert session.requested_kwargs["bar_size"].value == "5 mins"
     # historical_bars now takes an explicit keep_up_to_date parameter (default True,
-    # forwarded verbatim) -- a later, independently-discovered fix (2026-07-09) for
+    # forwarded verbatim) -- a later, independently-discovered fix for
     # the same persistent-subscription concern this test's docstring used to note as
     # "out of scope". The default preserves this function's long-standing
     # implicit-True behavior, so daily-bar benchmark fetches still keep ticking

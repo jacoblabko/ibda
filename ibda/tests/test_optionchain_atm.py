@@ -259,7 +259,7 @@ def test_subscribe_atm_option_never_raises_on_collaborator_exception(
 
 
 # ---------------------------------------------------------------------------
-# subscribe_atm_option -- multi-candidate strike walk (the NVDA-2026-07-09 fix)
+# subscribe_atm_option -- multi-candidate strike walk
 # ---------------------------------------------------------------------------
 
 

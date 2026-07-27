@@ -1,8 +1,7 @@
 """Pure tests for ``ibda.adapters.deephaven.views.snapshot_rows_where``'s
 failed-source-table degradation -- no JVM, no TWS.
 
-2026-07-14 fix: the deephaven-ib
-``bars_historical`` streaming table can enter a permanent Deephaven engine
+The deephaven-ib ``bars_historical`` streaming table can enter a permanent Deephaven engine
 "failed" state mid-session. Once failed, every ``.where()`` call against it
 raises ``io.deephaven.engine.exceptions.TableAlreadyFailedException``,
 surfaced to Python as ``deephaven.dherror.DHError: table where operation

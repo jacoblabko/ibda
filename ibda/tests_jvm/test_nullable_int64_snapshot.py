@@ -4,7 +4,7 @@ Characterises the nullable INT64 round-trip: whether a Deephaven ``long`` column
 containing NULL_LONG deserialises as float64 (the failure mode anticipated ahead
 of time) or as int64 (the current Deephaven behaviour).
 
-## What the JVM test found (run 2026-06-30)
+## What the JVM test found
 
 The bug does NOT reproduce.  Deephaven's ``to_pandas()`` returns
 ``pd.Int64Dtype()`` (nullable pandas integer) for a ``long`` column with a null
@@ -152,7 +152,7 @@ def _synthetic_float64_arrow() -> pa.Table:
 
 
 # =========================================================================
-# Steps 1–3: ACTUAL Deephaven JVM behaviour (as observed 2026-06-30)
+# Steps 1–3: ACTUAL Deephaven JVM behaviour (as observed)
 # =========================================================================
 
 def test_step1_to_pandas_null_long_is_nullable_int64_not_float() -> None:

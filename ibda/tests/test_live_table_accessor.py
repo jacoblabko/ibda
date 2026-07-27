@@ -6,7 +6,7 @@ plain sentinel object in place of a real deephaven Table. JVM-level proof that
 a *real* live Table round-trips through live_table() lives in
 ibda/tests_jvm/test_live_table_accessor_jvm.py.
 
-``live_table`` is a deliberate, dated design decision (2026-07-08): a documented in-engine
+``live_table`` is a deliberate design decision: a documented in-engine
 escape hatch, declared only on ``DeephavenPort`` (never on the ``DataPort`` ABC) so
 out-of-process consumers never see it.
 """

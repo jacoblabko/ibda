@@ -318,7 +318,7 @@ def test_subscribe_option_greeks_passes_trading_class_to_built_contract() -> Non
 def test_subscribe_option_greeks_skips_ambiguous_multi_contract() -> None:
     """Fix D: when the registered contract resolves to >1 ContractDetails
     (``rc.is_multi() is True`` -- e.g. SPY's SMART chain without a
-    ``trading_class``, live-verified 2026-07-16), ``subscribe_option_greeks``
+    ``trading_class``, live-verified), ``subscribe_option_greeks``
     must return ``None`` and NEVER call ``request_market_data`` -- mirroring
     ``marketdata.py``'s ``request_intraday_bars`` guard -- rather than letting
     the ambiguous contract fan out into N market-data lines for one call."""

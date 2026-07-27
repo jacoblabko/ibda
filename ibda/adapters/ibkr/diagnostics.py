@@ -159,7 +159,7 @@ _MARKET_DATA_WARNING_CODES: frozenset[int] = frozenset({
 #           on liquid US equities every cycle under market_data_type 1 AND 3; no
 #           bid/ask ever arrived.
 #   10168 — "not subscribed. Delayed market data is not enabled" — the 10167 sibling with
-#           no fallback (observed 2026-06-26 on an index: "not entitled").
+#           no fallback (observed on an index: "not entitled").
 #   10197 — "No market data during competing live session." IBKR admits one live
 #           market-data session per login; observed 158 times in a ~31s retry loop.
 _MARKET_DATA_DENIED_CODES: frozenset[int] = frozenset({

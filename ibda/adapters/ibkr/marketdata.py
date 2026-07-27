@@ -575,7 +575,7 @@ def historical_bars(
     requesting, say, ``"5 mins"`` bars for a contract whose ``"1 day"`` bars were already
     pulled earlier in the session returned the DAILY and 5-MINUTE candles UNIONED into one
     series (every daily bar duplicated, betas computed off a garbage mixed-granularity
-    series — the exact live defect that motivated this fix, first observed 2026-07-09).
+    series — the exact live defect that motivated this fix).
     ``bars_historical`` carries a ``RequestId``
     column precisely so concurrent/successive requests on the same contract stay
     distinguishable; this function now captures the ``Request`` returned by
@@ -594,12 +594,12 @@ def historical_bars(
         one-shot snapshot (e.g. a memoized once-per-process fetch) should pass ``False``
         explicitly.
 
-        **Measured consequence of ``False`` (paper account, market open, 2026-07-09 —
-        this docstring is the full trial record):** ``False`` still
+        **Measured consequence of ``False`` (paper account, market open — this
+        docstring is the full trial record):** ``False`` still
         populates ``bars_historical`` with the SAME rows as ``True``, including
-        TODAY'S still-forming bar (both delivered the identical last row, e.g.
-        ``2026-07-09`` local / ``2026-07-10 03:59:59+00:00`` on the wire, across 3
-        symbols). The forming bar is NOT absent under ``False`` — it is present but
+        TODAY'S still-forming bar (both delivered the identical last row — the same
+        local trading date, arriving as ``03:59:59+00:00`` the following day on the
+        wire, across 3 symbols). The forming bar is NOT absent under ``False`` — it is present but
         FROZEN at whatever value IB returned in that one initial delivery: ``True``
         additionally keeps that row refreshing as the session progresses (per
         deephaven-ib's own docstring, ``keep_up_to_date: True to continuously update

@@ -431,7 +431,7 @@ def subscribe_atm_option(
     """Subscribe the nearest-expiry (>= ``min_dte``), at-the-money option and return its conId.
 
     **This is NOT a hard "at most one market-data line" guarantee** — that claim was
-    live-verified false on 2026-07-16: SPY resolves to 2 ``ContractDetails`` on SMART
+    live-verified false: SPY resolves to 2 ``ContractDetails`` on SMART
     and spent 2 lines on one ``request_market_data`` call before this fix. Two
     mitigations are in place: (1) the already-parsed ``OptionParams.trading_class``
     is now passed through to ``subscribe_option_greeks``, letting IBKR collapse a
@@ -443,7 +443,7 @@ def subscribe_atm_option(
     resolution, the candidate loop below still advances to the next strike, so the
     true worst case across one call remains bounded by ``max_strike_candidates``, not
     a hard 1. Uses the ATM CALL by default — a call+put straddle would double the
-    line cost, which risks blowing a market-data-line quota (observed 2026-06-26:
+    line cost, which risks blowing a market-data-line quota (observed live:
     repeated restarts each re-subscribing without releasing prior lines exhausted
     the account's market-data-line allotment).
 
@@ -459,7 +459,7 @@ def subscribe_atm_option(
     across the WHOLE chain, not a per-expiry strike ladder — not every
     ``(expiry, strike)`` pair drawn independently from those lists is a real,
     listed contract. The single-nearest-strike-at-the-nearest-expiry choice this
-    function used to make could (and, live, did — NVDA, 2026-07-09) pick a
+    function used to make could (and, live, did) pick a
     nonexistent combination: IBKR then rejects it with ``ErrorCode=200`` ("No
     security definition has been found for the request") and the name silently
     drops from any caller treating a lone failed attempt as "no contract exists."
