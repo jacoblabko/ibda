@@ -45,7 +45,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
-from typing import Any, Protocol, Union, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import pyarrow as pa
 
@@ -441,6 +441,19 @@ def compute_performance(
 
     returns = daily_returns(source, value_column=value_column, flows=flows)
     n = len(returns)
+    if n == 0:
+        # `len(values) >= 2` above is NOT sufficient: `_dated_returns` skips any period
+        # whose prior NAV is 0.0, so two NAV points can still yield zero returns — e.g.
+        # `Total = [0.0, 100000.0]`, a Flex report whose first row precedes funding, or a
+        # `Cash`/`Stock` column that is legitimately 0.0 on a fully-invested / all-cash day.
+        # Without this, `hit_rate = ... / n` raised a bare ZeroDivisionError (and
+        # `max(returns)`/`min(returns)` would have raised on the empty sequence) instead of
+        # this module's actionable message.
+        raise ValueError(
+            "no usable return periods: every period was skipped because the prior NAV was "
+            f"0.0 (NAV points={len(values)}, column={value_column!r}). Check that the NAV "
+            "series starts at or after the account was funded."
+        )
 
     sharpe = _sharpe_from_returns(
         returns, risk_free_annual=risk_free_annual, periods_per_year=periods_per_year
@@ -468,8 +481,8 @@ def compute_performance(
         net_flows = math.fsum(flows.values())
 
     # source is already validated/filtered to at most one account by _select_account
-    # above, so accts (if non-empty) all agree — accts[0] is no longer a silent pick
-    # among *different* accounts, just reading the single account's label back out.
+    # above, so accts (if non-empty) all agree — accts[0] is not a silent pick among
+    # *different* accounts, just reading the single account's label back out.
     account_label: str | None = None
     if "Account" in source.column_names:
         accts = [
@@ -502,7 +515,7 @@ def compute_performance(
 
 
 def sharpe_ratio(
-    source: Union[_HasTable, _HasSnapshot, pa.Table],
+    source: _HasTable | _HasSnapshot | pa.Table,
     *,
     flows: Mapping[date, float] | None = None,
     risk_free_annual: str | float = DEFAULT_RISK_FREE_ANNUAL,
@@ -603,7 +616,7 @@ def external_flows_from_cash(cash: pa.Table) -> dict[date, float]:
 
 
 def _resolve_source(
-    source: Union[_HasTable, _HasSnapshot, pa.Table],
+    source: _HasTable | _HasSnapshot | pa.Table,
     *,
     adjust_for_flows: bool,
     account: str | None = None,
@@ -665,7 +678,7 @@ def _resolve_source(
 
 
 def performance_summary(
-    source: Union[_HasTable, _HasSnapshot, pa.Table],
+    source: _HasTable | _HasSnapshot | pa.Table,
     *,
     risk_free_annual: str | float = DEFAULT_RISK_FREE_ANNUAL,
     periods_per_year: int = DEFAULT_PERIODS_PER_YEAR,

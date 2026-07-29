@@ -985,3 +985,27 @@ def test_sortino_and_annualized_return_multi_point_unchanged() -> None:
     assert _annualized_return_from_returns(
         rets, periods_per_year=ppy
     ) == pytest.approx(exp_annualized_return)
+
+
+def test_all_periods_skipped_raises_an_actionable_error_not_zerodivision() -> None:
+    """`len(values) >= 2` does not imply at least one usable return period.
+
+    `_dated_returns` skips any period whose prior NAV is 0.0, so `[0.0, 100000.0]` — a Flex
+    report whose first row precedes funding — yielded zero returns and then divided by n in
+    `hit_rate`. Unguarded that is a bare `ZeroDivisionError`, with `max(returns)` raising on
+    the empty sequence immediately after.
+    """
+    import datetime as _dt
+
+    import pyarrow as pa
+
+    nav = pa.table({
+        "Account": ["U1", "U1"],
+        "Timestamp": [
+            _dt.datetime(2026, 1, 1, tzinfo=_dt.timezone.utc),
+            _dt.datetime(2026, 1, 2, tzinfo=_dt.timezone.utc),
+        ],
+        "Total": [0.0, 100_000.0],
+    })
+    with pytest.raises(ValueError, match="no usable return periods"):
+        compute_performance(nav)

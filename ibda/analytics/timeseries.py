@@ -12,8 +12,9 @@ Pure module: stdlib + pyarrow only. No engine, no vendor SDK.
 """
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Union, cast
+from collections.abc import Mapping
+from datetime import date, datetime
+from typing import TypeAlias, cast
 
 import pyarrow as pa
 
@@ -23,19 +24,58 @@ from ibda.analytics.performance import (
     _HasSnapshot,
     _HasTable,
     _max_drawdown,
+    _dated_returns,
     _nav_series,
     _resolve_source,
+    _select_account,
     _sharpe_from_returns,
-    daily_returns,
 )
 from ibda.rates import DEFAULT_PERIODS_PER_YEAR, DEFAULT_RISK_FREE_ANNUAL, resolve_risk_free
 
-_Source = Union[_HasTable, _HasSnapshot, pa.Table]
+#: Explicitly a ``TypeAlias``: ``pa.Table`` is untyped (Any), so mypy does not infer the
+#: bare ``A | B | Any`` assignment as an alias and rejects it at every use site.
+_Source: TypeAlias = _HasTable | _HasSnapshot | pa.Table
+
+
+
+def _returns_with_timestamps(
+    nav: pa.Table,
+    timestamps: list[datetime],
+    value_column: str,
+    flows: Mapping[date, float] | None,
+) -> tuple[list[float], list[datetime]]:
+    """Returns paired with the timestamp of the NAV point each one ENDS at.
+
+    The obvious ``ret_ts = timestamps[1:]`` assumes
+    ``len(returns) == len(timestamps) - 1``. ``_dated_returns`` does **not** guarantee
+    that: it *skips* any period whose prior NAV is ``0.0`` (documented in its own
+    docstring). That is reachable on the default ``value_column="Total"`` — a Flex report
+    whose first row precedes funding — and easily on the documented alternatives ``Cash``
+    and ``Stock``, which are legitimately ``0.0`` on a fully-invested or all-cash day.
+
+    Pairing returns to NAV points positionally cannot survive that skip: one skipped
+    period shifts every subsequent label one NAV point early — ``rolling_performance``
+    would stamp a window ending 2026-01-04 as 2026-01-03, contradicting its "labelled by
+    the timestamp of the window's last NAV point" contract — and ``periodic_returns``
+    would raise ``ValueError: zip() argument 2 is shorter than argument 1`` from its
+    ``strict=True`` zip. Both pair on timestamps instead.
+
+    Taking each return's own ``later_date`` from ``_dated_returns`` removes the assumption
+    rather than patching it — there is no alignment left to get wrong.
+    """
+    dated = _dated_returns(nav, value_column=value_column, flows=flows)
+    by_date: dict[date, datetime] = {}
+    for ts in timestamps:
+        by_date.setdefault(ts.date(), ts)
+    returns = [r for _, _, r in dated]
+    ret_ts = [by_date[later] for _, later, _ in dated]
+    return returns, ret_ts
 
 
 def rolling_performance(
     source: _Source,
     *,
+    account: str | None = None,
     window: int = 63,
     risk_free_annual: str | float = DEFAULT_RISK_FREE_ANNUAL,
     periods_per_year: int = DEFAULT_PERIODS_PER_YEAR,
@@ -66,11 +106,14 @@ def rolling_performance(
     if window < 2:
         raise ValueError(f"window must be >= 2 to define volatility; got {window}")
     rf, _rf_source = resolve_risk_free(risk_free_annual)
-    nav, flows = _resolve_source(source, adjust_for_flows=adjust_for_flows)
+    # account= is forwarded to _resolve_source so a DataPort's derived flows come from the
+    # SAME account as the NAV selected below — mirrors benchmark._aligned_returns exactly.
+    # _resolve_source never filters NAV (only cash), so _select_account remains the sole
+    # place NAV is filtered; no double-filtering.
+    nav, flows = _resolve_source(source, adjust_for_flows=adjust_for_flows, account=account)
+    nav = _select_account(nav, account)
     timestamps, _values = _nav_series(nav, value_column)
-    returns = daily_returns(nav, value_column=value_column, flows=flows)
-    # returns[i] is the return ENDING at timestamps[i + 1].
-    ret_ts = timestamps[1:]
+    returns, ret_ts = _returns_with_timestamps(nav, timestamps, value_column, flows)
 
     out_ts: list[datetime] = []
     out_ret: list[float] = []
@@ -110,6 +153,7 @@ def _period_key(ts: datetime, freq: str) -> str:
 def periodic_returns(
     source: _Source,
     *,
+    account: str | None = None,
     freq: str = "monthly",
     risk_free_annual: str | float = DEFAULT_RISK_FREE_ANNUAL,
     periods_per_year: int = DEFAULT_PERIODS_PER_YEAR,
@@ -138,10 +182,14 @@ def periodic_returns(
             is a non-numeric, non-``"auto"`` string.
     """
     rf, _rf_source = resolve_risk_free(risk_free_annual)
-    nav, flows = _resolve_source(source, adjust_for_flows=adjust_for_flows)
+    # account= is forwarded to _resolve_source so a DataPort's derived flows come from the
+    # SAME account as the NAV selected below — mirrors benchmark._aligned_returns exactly.
+    # _resolve_source never filters NAV (only cash), so _select_account remains the sole
+    # place NAV is filtered; no double-filtering.
+    nav, flows = _resolve_source(source, adjust_for_flows=adjust_for_flows, account=account)
+    nav = _select_account(nav, account)
     timestamps, _values = _nav_series(nav, value_column)
-    returns = daily_returns(nav, value_column=value_column, flows=flows)
-    ret_ts = timestamps[1:]
+    returns, ret_ts = _returns_with_timestamps(nav, timestamps, value_column, flows)
 
     # Preserve first-seen order of period keys.
     order: list[str] = []

@@ -21,7 +21,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time, timezone
-from typing import Any, Union, cast
+from typing import Any, TypeAlias, cast
 
 import pyarrow as pa
 
@@ -36,7 +36,9 @@ from ibda.analytics.performance import (
 )
 from ibda.rates import DEFAULT_PERIODS_PER_YEAR, DEFAULT_RISK_FREE_ANNUAL, resolve_risk_free
 
-_Portfolio = Union[_HasTable, _HasSnapshot, pa.Table]
+#: Explicitly a ``TypeAlias``: ``pa.Table`` is untyped (Any), so mypy does not infer the
+#: bare ``A | B | Any`` assignment as an alias and rejects it at every use site.
+_Portfolio: TypeAlias = _HasTable | _HasSnapshot | pa.Table
 
 # Public-facing ``benchmark_range`` strings (kept in the pre-existing, human-friendly
 # Yahoo-style vocabulary) mapped to the IB ``duration`` string

@@ -230,3 +230,62 @@ def test_render_shows_gross_and_net_labels() -> None:
     assert "Total net P&L" in text
     assert "Net profit factor" in text
     assert "Net expectancy" in text
+
+
+# ---------------------------------------------------------------------------
+# Realized P&L booked on a partially-closed position must not vanish
+# ---------------------------------------------------------------------------
+
+
+def test_partial_close_realized_pnl_is_reported_not_dropped() -> None:
+    """A partial close books real money even though the trade is still open.
+
+    `aggregate_round_trips` excludes open round-trips — correctly, since win-rate /
+    profit-factor / expectancy need completed trades. But its docstring justified that with
+    "their P&L is unrealized", which is false: `_add_exit` accumulates IBKR's
+    `fifoPnlRealized` on every partial close.
+
+    BUY 100 @10 then SELL 50 @15 books $250 of realized P&L and $2 of commission on a
+    round-trip that is still open. Without the dedicated fields, that money is reachable
+    only by reading the open round-trip object and `aggregates` reports 0.0 — so a journal
+    cannot reconcile against the account's realized P&L for any book holding a
+    partially-closed position.
+    """
+    r = reconstruct_round_trips([
+        _f("BUY", 100, 10.0, _t(0)),
+        _f("SELL", 50, 15.0, _t(5), rp=250.0),
+    ])
+    rt = r.round_trips[0]
+    assert rt.is_open is True
+    assert rt.realized_pnl == 250.0, "the partial close booked real money"
+
+    j = aggregate_round_trips(r)
+    # The completed-trade statistics correctly see nothing: no trade has finished.
+    assert j.aggregates["count"] == 0
+    assert j.aggregates["total_realized_pnl"] == 0.0
+    # ...but the money is surfaced rather than dropped.
+    assert j.open_realized_pnl == 250.0
+    assert j.open_commission == -2.0
+
+
+def test_open_totals_are_zero_when_no_position_is_partially_closed() -> None:
+    """A fully-closed book reports nothing on the open channel — no double-counting."""
+    j = aggregate_round_trips(reconstruct_round_trips([
+        _f("BUY", 100, 10.0, _t(0)),
+        _f("SELL", 100, 11.0, _t(5), rp=100.0),
+    ]))
+    assert j.aggregates["total_realized_pnl"] == 100.0
+    assert j.open_realized_pnl == 0.0
+    assert j.open_commission == 0.0
+
+
+def test_open_totals_sum_across_several_partially_closed_positions() -> None:
+    """Two names each partially closed — both contribute."""
+    j = aggregate_round_trips(reconstruct_round_trips([
+        _f("BUY", 100, 10.0, _t(0), sym="AAPL"),
+        _f("SELL", 50, 15.0, _t(1), rp=250.0, sym="AAPL"),
+        _f("BUY", 80, 20.0, _t(2), sym="MSFT"),
+        _f("SELL", 40, 22.0, _t(3), rp=80.0, sym="MSFT"),
+    ]))
+    assert j.aggregates["count"] == 0
+    assert j.open_realized_pnl == 330.0

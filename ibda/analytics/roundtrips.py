@@ -16,6 +16,7 @@ index (e.g. Flex report row order) via ``seq`` rather than relying on list order
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -221,6 +222,22 @@ class JournalResult:
     aggregates: dict[str, Any]
     by_group: dict[str, dict[str, Any]]
     warnings: list[dict[str, str]]
+    open_realized_pnl: float = 0.0
+    """``fifoPnlRealized`` already booked on round-trips that are still OPEN.
+
+    Non-zero whenever a position has been partially closed: each partial close accumulates
+    real, realized money via ``_add_exit``, but the trade is not finished so it is excluded
+    from ``aggregates`` (win-rate / profit-factor / expectancy are only meaningful over
+    completed trades).
+
+    Reported separately so the money does not simply disappear. A ``BUY 100 @10``
+    followed by ``SELL 50 @15`` books $250 of realized P&L on a round-trip that is still
+    flagged ``is_open``; ``aggregates`` excludes it by design, so without this field that
+    $250 is reported nowhere. A journal cannot reconcile against the account's realized
+    P&L for any book holding a partially-closed position without it."""
+    open_commission: float = 0.0
+    """Commission already paid on still-open round-trips. Same rationale as
+    :attr:`open_realized_pnl` — real money, excluded from the completed-trade statistics."""
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-safe dict (round-trip datetimes rendered as ISO-8601 strings)."""
@@ -375,8 +392,17 @@ def aggregate_round_trips(result: ReconstructResult, *, group_by: str = "symbol"
     the gross (commission-excluded, ``fifoPnlRealized``-only) fields and the ``net_*``
     commission-inclusive analogues — see :func:`_stats`.
 
-    group_by ∈ {"symbol","strategy"}. Open round-trips are excluded from all aggregates
-    (their P&L is unrealized) and returned separately.
+    group_by ∈ {"symbol","strategy"}. Open round-trips are excluded from the aggregates and
+    returned separately in ``open_round_trips``.
+
+    **They are excluded because the statistics need completed trades — NOT because their
+    P&L is unrealized.** That earlier justification was wrong: an open round-trip
+    accumulates ``realized_pnl`` and ``commission`` from every partial close via
+    :func:`_add_exit`, and that is IBKR's ``fifoPnlRealized`` — money actually booked.
+    Win-rate, profit-factor and expectancy are only meaningful over finished trades, so the
+    exclusion stands; but the money is now surfaced on
+    :attr:`JournalResult.open_realized_pnl` / :attr:`JournalResult.open_commission` instead
+    of vanishing.
     """
     if group_by not in ("symbol", "strategy"):
         raise ValueError(f"group_by must be 'symbol' or 'strategy', got {group_by!r}")
@@ -390,4 +416,7 @@ def aggregate_round_trips(result: ReconstructResult, *, group_by: str = "symbol"
         groups.setdefault(key(rt), []).append(rt)
     by_group = {k: _stats(v) for k, v in sorted(groups.items())}
     return JournalResult(round_trips=closed, open_round_trips=open_rts,
-                         aggregates=_stats(closed), by_group=by_group, warnings=result.warnings)
+                         aggregates=_stats(closed), by_group=by_group,
+                         warnings=result.warnings,
+                         open_realized_pnl=math.fsum(rt.realized_pnl for rt in open_rts),
+                         open_commission=math.fsum(rt.commission for rt in open_rts))
