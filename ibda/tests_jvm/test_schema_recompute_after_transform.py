@@ -1,8 +1,9 @@
-"""JVM regression test for #5: schema recompute after group_by / as_of_join.
+"""JVM regression test: schema recompute after group_by / as_of_join.
 
-Before commit 830c0a3, DeephavenPort.group_by() and as_of_join() returned the
-*input* schema unchanged.  The actual output table has a different column set, so
-result.schema was stale: schema.validate(result.snapshot()) raised SchemaMismatch.
+DeephavenPort.group_by() and as_of_join() once returned the *input* schema
+unchanged.  The actual output table has a different column set, so result.schema
+was stale: schema.validate(result.snapshot()) raised SchemaMismatch.  Both now
+derive the output schema from the handle's meta_table.
 
 This file is the regression guard.  Each test asserts:
 
@@ -85,12 +86,12 @@ def _adapter() -> Any:
 # ---------------------------------------------------------------------------
 
 def test_group_by_schema_matches_output_columns() -> None:
-    """Regression (#5): group_by result.schema reflects the OUTPUT columns, not the input.
+    """Regression: group_by result.schema reflects the OUTPUT columns, not the input.
 
     The position table has 9 columns.  After group_by(by=["Sym"], aggs={"ConId":
     "count"}), the output has exactly 2 columns (Sym, ConId).
 
-    Before the fix (830c0a3), group_by returned the full 9-column input schema.
+    Before the fix, group_by returned the full 9-column input schema.
     schema.validate() would then raise SchemaMismatch because it expected columns
     that Deephaven's agg_by dropped.
 
@@ -128,12 +129,12 @@ def test_group_by_schema_matches_output_columns() -> None:
 
 
 def test_as_of_join_schema_includes_joined_columns() -> None:
-    """Regression (#5): as_of_join result.schema includes right-table join columns.
+    """Regression: as_of_join result.schema includes right-table join columns.
 
     The fills table has 11 columns.  After as_of_join(..., joins=["Bid", "Ask"]),
     the output gains Bid and Ask from the right (quotes) table.
 
-    Before the fix (830c0a3), as_of_join returned the LEFT (fills) schema unchanged.
+    Before the fix, as_of_join returned the LEFT (fills) schema unchanged.
     result.schema.column_names would be missing Bid and Ask, meaning any downstream
     code inspecting the schema would have an incomplete view of the table.
 
