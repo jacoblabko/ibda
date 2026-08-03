@@ -5,10 +5,11 @@ import pyarrow as pa
 from ibda import schema as S
 
 
-ALL_SCHEMAS = [
-    S.ACCOUNT, S.POSITION, S.ORDER, S.EXECUTION, S.CASH, S.DEFINITION,
-    S.QUOTE, S.BAR, S.TRADE, S.BOOK,
-]
+# Taken from the registry rather than retyped: the hand-written list had drifted to
+# 10 of the 19 registered schemas, leaving 9 schemas (52 columns) outside the only
+# `col.doc` assertion in the repo. Reading `S.ALL` means a newly registered schema is
+# documented-or-red on the commit that adds it.
+ALL_SCHEMAS = list(S.ALL.values())
 
 
 def test_every_schema_is_wellformed_and_documented() -> None:

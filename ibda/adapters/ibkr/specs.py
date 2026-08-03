@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ibda.schema import ALL as ALL_SCHEMAS
 from ibda.schema._core import Schema
 
 
@@ -477,8 +476,3 @@ def null_columns(spec: IbkrTableSpec, schema: Schema) -> list[str]:
     """
     covered: set[str] = set(spec.renames.values())
     return [col.name for col in schema.columns if col.name not in covered]
-
-
-def get_schema(spec: IbkrTableSpec) -> Schema:
-    """Return the canonical Schema for *spec* from the global registry."""
-    return ALL_SCHEMAS[spec.schema_name]
