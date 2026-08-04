@@ -82,9 +82,25 @@ class ErrorTier(enum.Enum):
     * 10091 — "Part of requested market data requires additional subscription…
       Delayed market data is available" — partial, with a delayed fallback.
 
-    Both carry an explicit delayed-data clause. That clause is the whole test:
-    a caller receiving one of these has data in hand and should keep going with
-    its provenance downgraded. Log at WARNING; don't abort.
+    Both carry an explicit delayed-data clause — but **that clause is not the
+    test**, and must never be used as one. Live against TWS paper on 2026-08-04
+    a ``10089`` arrived reading, verbatim:
+
+        "Requested market data requires additional subscription for API. See link
+        in 'Market Data Connections' dialog for more details.**Delayed market data
+        is available.**SPY ARCA/TOP/ALL"
+
+    …and delivered **nothing** — 0 ticks over 45s under ``market_data_type=1``.
+    Re-requesting the same contract under type 3 produced ``10167`` and ticks did
+    arrive. So on a denial the clause advertises *that a different market-data
+    type would work*, not that this request degraded gracefully.
+
+    The test is the **code**, which is how this module and the canonical
+    classifier both implement it. Delivery is the underlying truth the codes
+    encode; message text is not a proxy for it, and neither is the ``100xx``
+    prefix the two groups share. A caller receiving 10167/10091 has data in hand
+    and should keep going with its provenance downgraded. Log at WARNING; don't
+    abort.
 
     Codes that deny the request outright — 10089, 10168, 10197 — are NOT here.
     Nothing arrives for them, so they are :attr:`GENUINE_ERROR`; see
