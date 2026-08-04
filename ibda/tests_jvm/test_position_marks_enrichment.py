@@ -201,3 +201,76 @@ def test_enrich_column_order_matches_position_schema() -> None:
     assert actual_cols == expected_cols, (
         f"Column order mismatch.\nExpected: {expected_cols}\nActual:   {actual_cols}"
     )
+
+
+def _two_account_position_view() -> Any:
+    """The same contract held in two accounts, each with its own quantity."""
+    from deephaven import new_table
+    from deephaven.column import double_col, long_col, string_col
+
+    return new_table([
+        string_col("Account",      ["DU1", "DU2"]),
+        long_col("ConId",          [12345, 12345]),
+        string_col("Sym",          ["AAPL", "AAPL"]),
+        string_col("SecType",      ["STK", "STK"]),
+        double_col("Qty",          [100.0, 700.0]),
+        double_col("AvgCost",      [150.0, 150.0]),
+        string_col("Right",        [None, None]),
+        double_col("Strike",       [None, None]),
+        string_col("LastTradeDateOrContractMonth", [None, None]),
+        string_col("LocalSymbol",  ["AAPL", "AAPL"]),
+        double_col("Multiplier",   [None, None]),
+        string_col("Currency",     ["USD", "USD"]),
+        string_col("Exchange",     ["SMART", "SMART"]),
+        double_col("MarketPrice",  [float("nan"), float("nan")]),
+        double_col("MarketValue",  [float("nan"), float("nan")]),
+        double_col("UnrealizedPnl", [float("nan"), float("nan")]),
+    ]).update_view([
+        "MarketPrice   = isNull(MarketPrice)   || Double.isNaN(MarketPrice)   ? NULL_DOUBLE : MarketPrice",
+        "MarketValue   = isNull(MarketValue)   || Double.isNaN(MarketValue)   ? NULL_DOUBLE : MarketValue",
+        "UnrealizedPnl = isNull(UnrealizedPnl) || Double.isNaN(UnrealizedPnl) ? NULL_DOUBLE : UnrealizedPnl",
+    ])
+
+
+def _two_account_portfolio() -> Any:
+    """One mark row per account for the same contract, with different valuations."""
+    from deephaven import new_table
+    from deephaven.column import double_col, long_col, string_col
+
+    return new_table([
+        long_col("ContractId",      [12345,   12345],),
+        string_col("Account",       ["DU1",   "DU2"]),
+        string_col("Symbol",        ["AAPL",  "AAPL"]),
+        double_col("MarketPrice",   [150.0,   150.0]),
+        double_col("MarketValue",   [15000.0, 105000.0]),
+        double_col("UnrealizedPnL", [0.0,     500.0]),
+    ])
+
+
+def test_a_contract_held_in_two_accounts_keeps_each_account_s_own_mark() -> None:
+    """Account is part of the dedupe and join key, not just ContractId.
+
+    `accounts_portfolio` emits one mark row per (account, contract). Keying the dedupe
+    on the contract alone keeps only the last of them, and every other account's
+    position then joins to a mark belonging to a DIFFERENT account — MarketValue
+    attributed to the wrong book, silently and with no null to notice.
+
+    Here DU1 holds 100 shares (MarketValue 15,000) and DU2 holds 700 (105,000). Under
+    a contract-only key both rows take whichever mark survived, and the book is out by
+    90,000 on one of them.
+    """
+    from ibda.adapters.deephaven.views import enrich_position_with_marks
+
+    enriched = enrich_position_with_marks(
+        _two_account_position_view(), _two_account_portfolio()
+    )
+    import deephaven.pandas as dhpd
+
+    df = dhpd.to_pandas(enriched).set_index("Account")
+    assert float(df.loc["DU1", "MarketValue"]) == 15000.0, (
+        f"DU1 took another account's mark: {df.loc['DU1', 'MarketValue']}"
+    )
+    assert float(df.loc["DU2", "MarketValue"]) == 105000.0, (
+        f"DU2 took another account's mark: {df.loc['DU2', 'MarketValue']}"
+    )
+    assert float(df.loc["DU2", "UnrealizedPnl"]) == 500.0

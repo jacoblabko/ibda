@@ -41,15 +41,19 @@ Pure module: imports only stdlib + pyarrow. No engine, no vendor SDK.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Protocol, cast, runtime_checkable
+from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 
 from ibda.rates import DEFAULT_PERIODS_PER_YEAR, DEFAULT_RISK_FREE_ANNUAL, resolve_risk_free
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -583,8 +587,32 @@ def sharpe_ratio(
 # returns to avoid inflating/deflating Sharpe, Sortino, etc.
 _FLOW_TYPE_MARKERS: tuple[str, ...] = ("deposit", "withdraw", "transfer")
 
+# The account-local timezone the canonical `nav` series is anchored to.
+#
+# The Flex adapter — the authoritative source for both `nav` and `cash` — reports
+# one NAV point per report DATE and localizes that date to midnight in this zone
+# before converting to UTC. A NAV point therefore always lands in the small hours
+# of UTC, so its UTC calendar day and its day in this zone are the same, and
+# bucketing a NAV point by either rule gives the same answer.
+#
+# A cash row is different: it carries a real time of day. A movement booked in the
+# evening — after 19:00 or 20:00 local, depending on the season — has already
+# rolled into the NEXT UTC day, so bucketing it by UTC date would subtract it from
+# the following period's return while the NAV series still counts it in the
+# current one. Bucketing cash by this zone's calendar day is what keeps the two
+# sides on the same trading day. Change this constant together with the Flex
+# adapter's timezone constant; they describe the same account setting.
+_NAV_DAY_TZ: ZoneInfo = ZoneInfo("America/New_York")
 
-def external_flows_from_cash(cash: pa.Table) -> dict[date, float]:
+# The base currency assumed when a cash row's Currency cannot be converted from a
+# per-row FX rate. IBKR reports NAV in the account's base currency; a flow must be
+# in the same units before it can be subtracted from a NAV change.
+DEFAULT_BASE_CURRENCY: str = "USD"
+
+
+def external_flows_from_cash(
+    cash: pa.Table, *, base_currency: str = DEFAULT_BASE_CURRENCY
+) -> dict[date, float]:
     """Aggregate deposit/withdrawal/transfer cash transactions into per-date net flows.
 
     Matches canonical ``cash`` rows whose ``Type`` mentions "deposit",
@@ -596,22 +624,92 @@ def external_flows_from_cash(cash: pa.Table) -> dict[date, float]:
     so their cash-equivalent value is stripped from NAV-based returns (Sharpe,
     Sortino, Calmar). Unvalued transfers are not mapped to cash rows and are
     therefore not stripped; a warning is logged at parse time for those.
+
+    Currency contract
+    -----------------
+    NAV is reported in the account's base currency, so every flow must be in base
+    currency before it can be subtracted from a NAV change. ``Amount``/``Currency``
+    on a canonical cash row are the LOCAL pair, and ``FxRateToBase`` — when the
+    Flex query emits it — is that row's local→base rate. Each matched row is
+    resolved in this order:
+
+    1. a positive ``FxRateToBase`` → ``Amount * FxRateToBase``;
+    2. otherwise, ``Currency`` absent or equal to *base_currency* → ``Amount``
+       unchanged;
+    3. otherwise the row is SKIPPED and a WARNING is logged naming its date,
+       currency and amount.
+
+    Case 3 is deliberate: summing a foreign-currency magnitude into a
+    base-currency flow states a wrong number confidently, whereas a dropped flow
+    leaves the return over-attributed to trading by a known, logged amount.
+    A table with no ``Currency`` or no ``FxRateToBase`` column behaves exactly as
+    an all-base-currency table does — every row takes case 2.
+
+    Day anchoring
+    -------------
+    A row is bucketed by its calendar day in the account-local timezone
+    (:data:`_NAV_DAY_TZ`), not in UTC, so an evening-stamped movement lands on the
+    same day the NAV series counts it. See that constant for why the two rules
+    agree on NAV points and diverge only on intraday cash stamps.
+
+    Args:
+        cash: canonical ``cash`` Arrow table.
+        base_currency: the account's base currency, matched case-insensitively.
+
+    Returns:
+        Mapping of local calendar date → net external flow in *base_currency*.
     """
     cols = cash.column_names
     if "Type" not in cols or "Amount" not in cols or "Timestamp" not in cols:
         return {}
+    n = cash.num_rows
     types = cast("list[str | None]", cash.column("Type").to_pylist())
     amounts = cast("list[float | None]", cash.column("Amount").to_pylist())
     times = cast("list[datetime | None]", cash.column("Timestamp").to_pylist())
+    # Both currency columns are optional: a cash table produced before they
+    # existed must behave exactly as it does today, so absence reads as "no
+    # per-row currency information", not as an error.
+    currencies: list[str | None] = (
+        cast("list[str | None]", cash.column("Currency").to_pylist())
+        if "Currency" in cols
+        else [None] * n
+    )
+    rates: list[float | None] = (
+        cast("list[float | None]", cash.column("FxRateToBase").to_pylist())
+        if "FxRateToBase" in cols
+        else [None] * n
+    )
+    base = base_currency.strip().upper()
 
     out: dict[date, float] = {}
-    for typ, amt, ts in zip(types, amounts, times, strict=True):
+    for typ, amt, ts, ccy, rate in zip(
+        types, amounts, times, currencies, rates, strict=True
+    ):
         if typ is None or amt is None or ts is None:
             continue
         low = typ.lower()
-        if any(marker in low for marker in _FLOW_TYPE_MARKERS):
-            d = ts.date()
+        if not any(marker in low for marker in _FLOW_TYPE_MARKERS):
+            continue
+        # A naive Timestamp cannot be converted safely (astimezone would read the
+        # process's local zone); the canonical schema declares UTC, so treat it so.
+        stamp = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+        d = stamp.astimezone(_NAV_DAY_TZ).date()
+        if rate is not None and rate > 0.0:
+            out[d] = out.get(d, 0.0) + float(amt) * float(rate)
+        elif ccy is None or ccy.strip().upper() == base:
             out[d] = out.get(d, 0.0) + float(amt)
+        else:
+            logger.warning(
+                "external_flows_from_cash: skipping %s flow of %s %s on %s — no "
+                "positive FxRateToBase to convert it to the %s base currency. The "
+                "flow is NOT stripped from returns; that period's return is "
+                "over-attributed to trading by this amount.",
+                typ,
+                amt,
+                ccy,
+                d,
+                base,
+            )
     return out
 
 

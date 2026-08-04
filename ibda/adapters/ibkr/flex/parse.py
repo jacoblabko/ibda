@@ -299,6 +299,16 @@ def _parse_cash(stmt: ET.Element) -> list[dict[str, Any]]:
             "description": a.get("description"),
             # account field needed by the canonical mapping (mapping.py)
             "account": a.get("accountId") or "",
+            # IBKR's local->base conversion rate for this row: base = amount * fxRateToBase.
+            # Emitted only when the Flex query selects the field, so None is normal on a
+            # single-currency query; the mapping keeps Amount/Currency as the LOCAL pair
+            # and carries the rate alongside rather than converting here.
+            "fxRateToBase": _to_float(a.get("fxRateToBase"), "fxRateToBase"),
+            # IBKR's own identifier for the transaction, mirroring the exec_id line in
+            # _parse_trades. Emitted only when the Flex query definition selects the
+            # transactionID field, so "" is the common case and the canonical mapping
+            # falls back to a deterministic content-derived id.
+            "transaction_id": a.get("transactionID") or "",
         })
     return out
 

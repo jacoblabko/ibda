@@ -14,7 +14,11 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
-from ibda.adapters.ibkr.flex.mapping import _parse_dt, flex_sections_to_canonical
+from ibda.adapters.ibkr.flex.mapping import (
+    _parse_dt,
+    _parse_dt_or_none,
+    flex_sections_to_canonical,
+)
 from ibda.adapters.ibkr.flex.parse import _to_float, parse_statement
 from ibda.analytics.performance import compute_performance, external_flows_from_cash
 from ibda.schema import CASH, EXECUTION, NAV
@@ -312,6 +316,524 @@ def test_compact_cash_flow_strips_from_performance() -> None:
     assert perf.flows_applied is True
     assert perf.net_external_flows == pytest.approx(50_000.0)
     assert perf.cumulative_return == pytest.approx(0.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Cash rows with an unusable Timestamp are DROPPED, not anchored to the epoch.
+#
+# A cash movement attributed to 1970-01-01 falls outside every NAV series, so it
+# is silently absent from flow-adjusted returns either way. Dropping it with a
+# WARNING makes that loss countable; the epoch anchor made it invisible.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_dt_or_none_returns_none_for_absent_and_unparseable() -> None:
+    """The non-substituting parser reports failure instead of inventing a value."""
+    assert _parse_dt_or_none(None) is None
+    assert _parse_dt_or_none("") is None
+    assert _parse_dt_or_none("definitely-not-a-date") is None
+    # ...and still parses everything the substituting form does.
+    assert _parse_dt_or_none("20260602;094850") == datetime(
+        2026, 6, 2, 13, 48, 50, tzinfo=timezone.utc
+    )
+
+
+_BAD_CASH_DATE_XML = textwrap.dedent("""\
+    <FlexQueryResponse queryName="Activity" type="AF">
+    <FlexStatements count="1">
+    <FlexStatement accountId="U9999" fromDate="2026-06-01" toDate="2026-06-02">
+    <Trades/>
+    <CashTransactions>
+    <CashTransaction accountId="U9999" symbol="MSFT" type="Dividends"
+      dateTime="not-a-date" amount="42.50" currency="USD" description="MSFT DIVIDEND"/>
+    <CashTransaction accountId="U9999" symbol="" type="Broker Interest Received"
+      dateTime="2026-06-02" amount="3.21" currency="USD" description="CREDIT INT"/>
+    </CashTransactions>
+    </FlexStatement>
+    </FlexStatements>
+    </FlexQueryResponse>
+""")
+
+
+def test_cash_row_with_unparseable_datetime_is_dropped_and_warned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unparseable dateTime drops the row, logs it, and leaves siblings alone."""
+    parsed = parse_statement(_BAD_CASH_DATE_XML)
+    assert parsed["status"] == "ok"
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        canon = flex_sections_to_canonical(parsed["sections"])
+
+    cash = canon["cash"]
+    assert len(cash) == 1, (
+        f"the row with dateTime='not-a-date' must be dropped, not anchored to 1970; got {cash}"
+    )
+    # The good sibling row survives untouched.
+    assert cash[0]["Amount"] == 3.21
+    assert cash[0]["Timestamp"] != datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("not-a-date" in m for m in warnings), (
+        f"expected a WARNING naming the raw dateTime; got: {warnings}"
+    )
+    assert any("unusable Timestamp" in m for m in warnings), (
+        f"expected the drop reason to be identifiable in the log; got: {warnings}"
+    )
+
+
+def test_cash_row_with_absent_datetime_is_dropped() -> None:
+    """A CashTransaction with no dateTime attribute at all is dropped too."""
+    xml = textwrap.dedent("""\
+        <FlexQueryResponse queryName="Activity" type="AF">
+        <FlexStatements count="1">
+        <FlexStatement accountId="U9999" fromDate="2026-06-01" toDate="2026-06-02">
+        <Trades/>
+        <CashTransactions>
+        <CashTransaction accountId="U9999" symbol="MSFT" type="Dividends"
+          amount="42.50" currency="USD" description="MSFT DIVIDEND"/>
+        </CashTransactions>
+        </FlexStatement>
+        </FlexStatements>
+        </FlexQueryResponse>
+    """)
+    parsed = parse_statement(xml)
+    assert parsed["status"] == "ok"
+    canon = flex_sections_to_canonical(parsed["sections"])
+    assert canon["cash"] == []
+
+
+def test_cash_drop_summary_separates_the_two_causes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Missing-Amount and unusable-Timestamp drops are counted separately.
+
+    One log line that says only "N rows skipped" cannot tell a Flex query with a
+    missing amount field from one emitting a date format the parser does not know;
+    those need different fixes, so the counts stay separable.
+    """
+    xml = textwrap.dedent("""\
+        <FlexQueryResponse queryName="Activity" type="AF">
+        <FlexStatements count="1">
+        <FlexStatement accountId="U9999" fromDate="2026-06-01" toDate="2026-06-02">
+        <Trades/>
+        <CashTransactions>
+        <CashTransaction accountId="U9999" symbol="MSFT" type="Dividends"
+          dateTime="2026-06-02" currency="USD" description="NO AMOUNT"/>
+        <CashTransaction accountId="U9999" symbol="AAPL" type="Dividends"
+          dateTime="nonsense" amount="1.00" currency="USD" description="BAD DATE"/>
+        <CashTransaction accountId="U9999" symbol="GOOG" type="Dividends"
+          dateTime="also-nonsense" amount="2.00" currency="USD" description="BAD DATE 2"/>
+        </CashTransactions>
+        </FlexStatement>
+        </FlexStatements>
+        </FlexQueryResponse>
+    """)
+    parsed = parse_statement(xml)
+    assert parsed["status"] == "ok"
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        canon = flex_sections_to_canonical(parsed["sections"])
+
+    assert canon["cash"] == []
+    summaries = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "Skipped" in r.getMessage()
+    ]
+    assert len(summaries) == 1, f"expected exactly one summary line; got: {summaries}"
+    assert "Skipped 3 cash row(s): 1 with a missing Amount, 2 with an unusable" in summaries[0], (
+        f"expected per-cause counts in the summary; got: {summaries[0]!r}"
+    )
+
+
+def test_cash_row_with_a_legitimate_1970_datetime_is_kept() -> None:
+    """1970-01-01 is a parseable date, so it must survive — the drop rule keys on
+    'unparseable', not on 'looks like the epoch'. A real (if implausible) 1970
+    movement must not become collateral damage of the bad-date fix."""
+    xml = textwrap.dedent("""\
+        <FlexQueryResponse queryName="Activity" type="AF">
+        <FlexStatements count="1">
+        <FlexStatement accountId="U9999" fromDate="1970-01-01" toDate="1970-01-02">
+        <Trades/>
+        <CashTransactions>
+        <CashTransaction accountId="U9999" symbol="" type="Deposits/Withdrawals"
+          dateTime="19700101" amount="100.00" currency="USD" description="ANCIENT"/>
+        </CashTransactions>
+        </FlexStatement>
+        </FlexStatements>
+        </FlexQueryResponse>
+    """)
+    parsed = parse_statement(xml)
+    assert parsed["status"] == "ok"
+    canon = flex_sections_to_canonical(parsed["sections"])
+    assert len(canon["cash"]) == 1
+    ts: datetime = canon["cash"][0]["Timestamp"]
+    # 1970-01-01 ET midnight (EST, UTC-5) -> 1970-01-01T05:00Z.
+    assert ts == datetime(1970, 1, 1, 5, 0, tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Multi-currency: fxRateToBase survives parse -> canonical, and Amount/Currency
+# stay the LOCAL pair.
+# ---------------------------------------------------------------------------
+
+_EUR_CASH_XML = textwrap.dedent("""\
+    <FlexQueryResponse queryName="Activity" type="AF">
+    <FlexStatements count="1">
+    <FlexStatement accountId="U9999" fromDate="2026-06-01" toDate="2026-06-02">
+    <Trades/>
+    <CashTransactions>
+    <CashTransaction accountId="U9999" symbol="" type="Deposits/Withdrawals"
+      dateTime="2026-06-02" amount="1000.00" currency="EUR" fxRateToBase="1.08"
+      description="EUR WIRE IN"/>
+    <CashTransaction accountId="U9999" symbol="" type="Deposits/Withdrawals"
+      dateTime="2026-06-02" amount="500.00" currency="USD" fxRateToBase="1"
+      description="USD ACH IN"/>
+    </CashTransactions>
+    </FlexStatement>
+    </FlexStatements>
+    </FlexQueryResponse>
+""")
+
+
+def test_cash_fx_rate_to_base_survives_parse_to_canonical() -> None:
+    """fxRateToBase on a CashTransaction reaches the canonical FxRateToBase column."""
+    parsed = parse_statement(_EUR_CASH_XML)
+    assert parsed["status"] == "ok"
+    assert parsed["sections"]["cash"][0]["fxRateToBase"] == pytest.approx(1.08)
+
+    canon = flex_sections_to_canonical(parsed["sections"])
+    eur = next(r for r in canon["cash"] if r["Currency"] == "EUR")
+    usd = next(r for r in canon["cash"] if r["Currency"] == "USD")
+    assert eur["FxRateToBase"] == pytest.approx(1.08)
+    assert usd["FxRateToBase"] == pytest.approx(1.0)
+    # Amount and Currency remain the LOCAL pair — the row is not pre-converted.
+    assert eur["Amount"] == pytest.approx(1000.0)
+    assert set(eur).issubset(set(CASH.column_names))
+
+
+def test_cash_fx_rate_is_none_when_flex_omits_it() -> None:
+    """A query that does not select fxRateToBase yields None, not a fabricated 1.0."""
+    canon = flex_sections_to_canonical(_sections())
+    assert all(r["FxRateToBase"] is None for r in canon["cash"])
+
+
+def test_transfer_row_carries_its_fx_rate_to_base() -> None:
+    """A mapped transfer exposes the same rate, so the cash table is homogeneous."""
+    from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+    result = _map_transfer({
+        "symbol": "SAP",
+        "date_time": "2026-06-02",
+        "direction": "IN",
+        "positionAmountInBase": 10_800.0,
+        "fxRateToBase": 1.08,
+        "currency": "EUR",
+    })
+    assert result is not None
+    # base 10,800 / 1.08 -> 10,000 EUR local, labelled EUR, with the rate attached.
+    assert result["Amount"] == pytest.approx(10_000.0)
+    assert result["Currency"] == "EUR"
+    assert result["FxRateToBase"] == pytest.approx(1.08)
+
+
+# ---------------------------------------------------------------------------
+# Evening-stamped cash must bucket to the account-local day the NAV series uses.
+# ---------------------------------------------------------------------------
+
+_EVENING_CASH_XML = textwrap.dedent("""\
+    <FlexQueryResponse queryName="Activity" type="AF">
+    <FlexStatements count="1">
+    <FlexStatement accountId="U9999999" fromDate="2026-06-01" toDate="2026-06-03" period="Custom">
+    <Trades/>
+    <CashTransactions>
+    <CashTransaction accountId="U9999999" symbol="" type="Deposits/Withdrawals"
+      dateTime="20260602;210000" amount="50000.00" currency="USD"
+      description="EVENING ACH TRANSFER"/>
+    </CashTransactions>
+    <EquitySummaryInBase>
+    <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="20260601"
+      cash="100000.00" stock="0.00" total="100000.00"/>
+    <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="20260602"
+      cash="150000.00" stock="0.00" total="150000.00"/>
+    <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="20260603"
+      cash="150000.00" stock="0.00" total="150000.00"/>
+    </EquitySummaryInBase>
+    </FlexStatement>
+    </FlexStatements>
+    </FlexQueryResponse>
+""")
+
+
+def test_evening_et_cash_buckets_to_the_same_local_day_as_nav() -> None:
+    """A 21:00 local deposit is already the NEXT day in UTC; it must still be
+    stripped from the day the NAV series booked it on.
+
+    The deposit is stamped 2026-06-02 21:00 local = 2026-06-03T01:00Z, and the NAV
+    series shows the 50,000 arriving on report date 2026-06-02. Bucketing the flow
+    by its UTC date keys it to 06-03, leaving 06-02 with a fabricated +50% return.
+    """
+    parsed = parse_statement(_EVENING_CASH_XML)
+    assert parsed["status"] == "ok"
+    canon = flex_sections_to_canonical(parsed["sections"])
+
+    cash_table = pa.table(
+        {
+            col.name: pa.array(
+                [r.get(col.name) for r in canon["cash"]], type=col.dtype.to_arrow()
+            )
+            for col in CASH.columns
+        },
+        schema=CASH.to_arrow_schema(),
+    )
+    # The stored Timestamp really is the next UTC day — the roll is present in the
+    # data, and the bucketing rule is what has to undo it.
+    assert canon["cash"][0]["Timestamp"] == datetime(2026, 6, 3, 1, 0, tzinfo=timezone.utc)
+
+    flows = external_flows_from_cash(cash_table)
+    assert date(2026, 6, 2) in flows, (
+        f"evening deposit rolled off its NAV day; flow keys: {list(flows)}"
+    )
+    assert date(2026, 6, 3) not in flows
+    assert flows[date(2026, 6, 2)] == pytest.approx(50_000.0)
+
+    nav_table = pa.table(
+        {
+            col.name: pa.array(
+                [r.get(col.name) for r in canon["nav"]], type=col.dtype.to_arrow()
+            )
+            for col in NAV.columns
+        },
+        schema=NAV.to_arrow_schema(),
+    )
+    perf = compute_performance(nav_table, flows=flows)
+    # With the deposit stripped from 06-02, the 100k->150k move is a 0% return.
+    assert perf.cumulative_return == pytest.approx(0.0, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# TxnId: cash rows carry an id, so the same movement seen twice is counted once.
+# ---------------------------------------------------------------------------
+
+_CASH_WITH_TXN_ID_XML = textwrap.dedent("""\
+    <FlexQueryResponse queryName="Activity" type="AF">
+    <FlexStatements count="1">
+    <FlexStatement accountId="U9999" fromDate="2026-06-01" toDate="2026-06-02">
+    <Trades/>
+    <CashTransactions>
+    <CashTransaction accountId="U9999" symbol="MSFT" type="Dividends"
+      dateTime="2026-06-02" amount="42.50" currency="USD" transactionID="7788991"
+      description="MSFT CASH DIVIDEND"/>
+    <CashTransaction accountId="U9999" symbol="" type="Broker Interest Received"
+      dateTime="2026-06-02" amount="3.21" currency="USD" description="CREDIT INT"/>
+    </CashTransactions>
+    </FlexStatement>
+    </FlexStatements>
+    </FlexQueryResponse>
+""")
+
+
+def test_cash_txn_id_prefers_the_ibkr_transaction_id() -> None:
+    """When IBKR supplies transactionID it is used verbatim, unprefixed."""
+    parsed = parse_statement(_CASH_WITH_TXN_ID_XML)
+    assert parsed["status"] == "ok"
+    canon = flex_sections_to_canonical(parsed["sections"])
+    div = next(r for r in canon["cash"] if r["Type"] == "Dividends")
+    interest = next(r for r in canon["cash"] if r["Type"] == "Broker Interest Received")
+
+    assert div["TxnId"] == "7788991"
+    # The sibling row has no transactionID, so it falls back to a marked synthetic.
+    assert interest["TxnId"].startswith("syn-")
+    assert set(div).issubset(set(CASH.column_names))
+
+
+def test_synthetic_cash_id_is_deterministic_across_parses() -> None:
+    """Parsing the same report twice yields identical ids — the property that makes
+    de-duplicating a re-ingested overlapping window possible at all."""
+    first = flex_sections_to_canonical(parse_statement(_COMPACT_CASH_XML)["sections"])
+    second = flex_sections_to_canonical(parse_statement(_COMPACT_CASH_XML)["sections"])
+    assert [r["TxnId"] for r in first["cash"]] == [r["TxnId"] for r in second["cash"]]
+    assert all(r["TxnId"].startswith("syn-") for r in first["cash"])
+
+
+def test_synthetic_cash_id_distinguishes_rows_that_differ_in_any_field() -> None:
+    """Rows differing in exactly one identifying field must not collide."""
+    from ibda.adapters.ibkr.flex.mapping import _synthetic_cash_id
+
+    base: dict[str, Any] = {
+        "Account": "U9999",
+        "Timestamp": datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc),
+        "Type": "Dividends",
+        "Sym": "MSFT",
+        "Amount": 42.5,
+        "Currency": "USD",
+    }
+    baseline = _synthetic_cash_id(base)
+    for field, other in (
+        ("Account", "U8888"),
+        ("Timestamp", datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)),
+        ("Type", "Other Fees"),
+        ("Sym", "AAPL"),
+        ("Amount", 42.51),
+        ("Currency", "EUR"),
+    ):
+        variant = dict(base)
+        variant[field] = other
+        assert _synthetic_cash_id(variant) != baseline, f"{field} does not affect the id"
+
+
+_OVERLAPPING_STATEMENTS_XML = textwrap.dedent("""\
+    <FlexQueryResponse queryName="Activity" type="AF">
+    <FlexStatements count="2">
+    <FlexStatement accountId="U9999999" fromDate="2026-06-01" toDate="2026-06-02" period="Custom">
+    <Trades/>
+    <CashTransactions>
+    <CashTransaction accountId="U9999999" symbol="" type="Deposits/Withdrawals"
+      dateTime="20260602;094850" amount="50000.00" currency="USD"
+      description="ACH TRANSFER"/>
+    </CashTransactions>
+    </FlexStatement>
+    <FlexStatement accountId="U9999999" fromDate="2026-06-02" toDate="2026-06-03" period="Custom">
+    <Trades/>
+    <CashTransactions>
+    <CashTransaction accountId="U9999999" symbol="" type="Deposits/Withdrawals"
+      dateTime="20260602;094850" amount="50000.00" currency="USD"
+      description="ACH TRANSFER"/>
+    </CashTransactions>
+    </FlexStatement>
+    </FlexStatements>
+    </FlexQueryResponse>
+""")
+
+
+def test_cash_rows_are_deduped_across_overlapping_statements(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One movement reported by two overlapping statement windows is counted once.
+
+    Without de-duplication the 50,000 deposit is summed twice and every
+    flow-adjusted return built on it is wrong by a full deposit.
+    """
+    parsed = parse_statement(_OVERLAPPING_STATEMENTS_XML)
+    assert parsed["status"] == "ok"
+    # The duplication is real at the parse layer — both statements are read.
+    assert len(parsed["sections"]["cash"]) == 2
+
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        canon = flex_sections_to_canonical(parsed["sections"])
+
+    assert len(canon["cash"]) == 1, (
+        f"the repeated deposit must survive exactly once; got {canon['cash']}"
+    )
+
+    cash_table = pa.table(
+        {
+            col.name: pa.array(
+                [r.get(col.name) for r in canon["cash"]], type=col.dtype.to_arrow()
+            )
+            for col in CASH.columns
+        },
+        schema=CASH.to_arrow_schema(),
+    )
+    flows = external_flows_from_cash(cash_table)
+    assert flows[date(2026, 6, 2)] == pytest.approx(50_000.0), (
+        "the deposit was counted more than once"
+    )
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("Dropped 1 cash row(s) identical in" in m for m in warnings), (
+        f"the collapse must be logged, with its limits stated; got: {warnings}"
+    )
+
+
+def test_dedupe_by_ibkr_id_ignores_unrelated_field_differences(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two rows sharing a real transactionID are the same transaction even if a
+    non-identifying detail was re-stated differently between reports."""
+    xml = textwrap.dedent("""\
+        <FlexQueryResponse queryName="Activity" type="AF">
+        <FlexStatements count="1">
+        <FlexStatement accountId="U9999" fromDate="2026-06-01" toDate="2026-06-02">
+        <Trades/>
+        <CashTransactions>
+        <CashTransaction accountId="U9999" symbol="MSFT" type="Dividends"
+          dateTime="2026-06-02" amount="42.50" currency="USD" transactionID="7788991"
+          description="MSFT CASH DIVIDEND"/>
+        <CashTransaction accountId="U9999" symbol="MSFT" type="Dividends"
+          dateTime="2026-06-02" amount="42.50" currency="USD" transactionID="7788991"
+          description="MSFT DIVIDEND (RESTATED)"/>
+        </CashTransactions>
+        </FlexStatement>
+        </FlexStatements>
+        </FlexQueryResponse>
+    """)
+    parsed = parse_statement(xml)
+    assert parsed["status"] == "ok"
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        canon = flex_sections_to_canonical(parsed["sections"])
+
+    assert len(canon["cash"]) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("sharing an IBKR transactionID" in m for m in warnings), (
+        f"an IBKR-id collapse must be reported as such, not as a content match; got: {warnings}"
+    )
+
+
+def test_distinct_cash_rows_are_all_kept(caplog: pytest.LogCaptureFixture) -> None:
+    """The de-duplication must not touch a report with no repeats.
+
+    Three genuinely different movements on the same day and account stay three
+    rows, and nothing is logged.
+    """
+    parsed = parse_statement(_FIXTURE.read_text())
+    assert parsed["status"] == "ok"
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        canon = flex_sections_to_canonical(parsed["sections"])
+
+    assert len(canon["cash"]) == 3
+    assert len({r["TxnId"] for r in canon["cash"]}) == 3
+    dedupe_warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "Dropped" in r.getMessage()
+    ]
+    assert not dedupe_warnings, f"unexpected de-duplication on a clean report: {dedupe_warnings}"
+
+
+def test_transfers_are_not_collapsed_into_one_row() -> None:
+    """Transfer rows get their own ids, so several distinct transfers all survive.
+
+    A shared null id would have made the de-duplication pass keep exactly one
+    transfer per report — silently deleting real capital movements.
+    """
+    xml = textwrap.dedent("""\
+        <FlexQueryResponse queryName="Test" type="AF">
+        <FlexStatements count="1">
+        <FlexStatement accountId="U9999999" fromDate="2026-06-01" toDate="2026-06-03">
+        <Trades/>
+        <CashTransactions/>
+        <Transfers>
+          <Transfer accountId="U9999999" symbol="TSLA" type="ACATS" date="20260602"
+            direction="IN" quantity="100" transferPrice="180.00"
+            positionAmount="18000.00" currency="USD" description="IN 1"/>
+          <Transfer accountId="U9999999" symbol="AMZN" type="ACATS" date="20260602"
+            direction="IN" quantity="50" transferPrice="200.00"
+            positionAmount="10000.00" currency="USD" description="IN 2"/>
+          <Transfer accountId="U9999999" symbol="NVDA" type="ACATS" date="20260603"
+            direction="OUT" quantity="10" transferPrice="100.00"
+            positionAmount="1000.00" currency="USD" description="OUT 1"/>
+        </Transfers>
+        </FlexStatement>
+        </FlexStatements>
+        </FlexQueryResponse>
+    """)
+    parsed = parse_statement(xml)
+    assert parsed["status"] == "ok"
+    canon = flex_sections_to_canonical(parsed["sections"])
+    transfers = [r for r in canon["cash"] if r["Type"] == "Transfer"]
+    assert len(transfers) == 3, f"transfers were collapsed: {transfers}"
+    assert len({r["TxnId"] for r in transfers}) == 3
+    assert all(r["TxnId"].startswith("syn-") for r in transfers)
 
 
 # ---------------------------------------------------------------------------

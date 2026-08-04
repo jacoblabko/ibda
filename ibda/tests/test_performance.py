@@ -399,7 +399,12 @@ def _multi_account_cash_table() -> pa.Table:
     Used to prove ``performance_summary``/``sharpe_ratio`` derive flows for
     *only* the requested account, not a mix of every account in the cash table.
     """
-    d2 = datetime(2026, 6, 2, tzinfo=timezone.utc)
+    # A market-hours stamp (10:00 ET), not midnight UTC: external_flows_from_cash
+    # buckets a cash row by its account-local calendar day, so a midnight-UTC stamp
+    # would denote the PREVIOUS local day and this fixture's intended flow date
+    # would depend on the bucketing rule rather than on the test's subject
+    # (account filtering). 14:00Z is the same calendar day in both zones.
+    d2 = datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc)
     return pa.table(
         {
             "Account": pa.array(["U1", "U2"], type=pa.string()),
@@ -518,8 +523,11 @@ def test_performance_summary_port_unknown_account_in_cash_degrades_gracefully() 
     cash = pa.table(
         {
             "Account": pa.array(["U2"], type=pa.string()),
+            # 10:00 ET — unambiguously 2026-06-02 in both UTC and the local zone
+            # cash flows are bucketed by (see _multi_account_cash_table).
             "Timestamp": pa.array(
-                [datetime(2026, 6, 2, tzinfo=timezone.utc)], type=pa.timestamp("ns", tz="UTC")
+                [datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc)],
+                type=pa.timestamp("ns", tz="UTC"),
             ),
             "Type": pa.array(["Deposits/Withdrawals"], type=pa.string()),
             "Sym": pa.array([None], type=pa.string()),
@@ -538,6 +546,171 @@ def test_performance_summary_port_unknown_account_in_cash_degrades_gracefully() 
     perf_u2 = performance_summary(port, account="U2")
     assert perf_u2.flows_applied
     assert perf_u2.cumulative_return == pytest.approx(0.01)
+
+
+# ---------------------------------------------------------------------------
+# Flow day-anchoring: cash is bucketed by the account-local calendar day.
+# ---------------------------------------------------------------------------
+
+
+def _flow_cash_table(
+    stamps: list[datetime],
+    amounts: list[float],
+    currencies: list[str | None] | None = None,
+    rates: list[float | None] | None = None,
+) -> pa.Table:
+    """Build a minimal cash table of deposit rows, one per stamp."""
+    n = len(stamps)
+    cols: dict[str, pa.Array] = {
+        "Account": pa.array(["U1"] * n, type=pa.string()),
+        "Timestamp": pa.array(stamps, type=pa.timestamp("ns", tz="UTC")),
+        "Type": pa.array(["Deposits/Withdrawals"] * n, type=pa.string()),
+        "Sym": pa.array([None] * n, type=pa.string()),
+        "Amount": pa.array(amounts, type=pa.float64()),
+        "Currency": pa.array(
+            currencies if currencies is not None else ["USD"] * n, type=pa.string()
+        ),
+    }
+    if rates is not None:
+        cols["FxRateToBase"] = pa.array(rates, type=pa.float64())
+    return pa.table(cols)
+
+
+def test_flow_day_anchoring_matches_the_flex_adapter_timezone() -> None:
+    """The zone flows are bucketed in is the one the Flex adapter anchors NAV to.
+
+    Two constants describing the same account setting can drift apart silently and
+    the symptom — a flow subtracted from the wrong day — looks like a data problem,
+    not a configuration one. Pin them together.
+    """
+    from ibda.adapters.ibkr.flex.mapping import _FLEX_TZ
+    from ibda.analytics.performance import _NAV_DAY_TZ
+
+    assert _NAV_DAY_TZ == _FLEX_TZ
+
+
+def test_external_flows_buckets_an_evening_stamp_to_the_local_day() -> None:
+    """21:00 local (already tomorrow in UTC) still belongs to today's NAV day."""
+    from datetime import date as _date
+
+    # 2026-06-02 21:00 America/New_York (EDT, UTC-4) == 2026-06-03T01:00Z.
+    stamp = datetime(2026, 6, 3, 1, 0, tzinfo=timezone.utc)
+    flows = external_flows_from_cash(_flow_cash_table([stamp], [50_000.0]))
+    assert flows == {_date(2026, 6, 2): pytest.approx(50_000.0)}
+
+
+def test_external_flows_naive_timestamp_is_read_as_utc() -> None:
+    """A naive Timestamp is treated as UTC, never as the process's local zone."""
+    from datetime import date as _date
+
+    naive = datetime(2026, 6, 3, 1, 0)
+    aware = datetime(2026, 6, 3, 1, 0, tzinfo=timezone.utc)
+    naive_table = pa.table(
+        {
+            "Timestamp": pa.array([naive], type=pa.timestamp("ns")),
+            "Type": pa.array(["Deposits/Withdrawals"], type=pa.string()),
+            "Amount": pa.array([50_000.0], type=pa.float64()),
+        }
+    )
+    assert external_flows_from_cash(naive_table) == {_date(2026, 6, 2): 50_000.0}
+    assert external_flows_from_cash(_flow_cash_table([aware], [50_000.0])) == {
+        _date(2026, 6, 2): 50_000.0
+    }
+
+
+# ---------------------------------------------------------------------------
+# Currency contract: flows are summed in base currency, never in mixed units.
+# ---------------------------------------------------------------------------
+
+_D2 = datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
+
+
+def test_external_flows_converts_local_to_base_with_fx_rate() -> None:
+    """A 1,000 EUR deposit at FxRateToBase=1.08 contributes 1,080 base currency."""
+    from datetime import date as _date
+
+    flows = external_flows_from_cash(
+        _flow_cash_table([_D2], [1_000.0], currencies=["EUR"], rates=[1.08])
+    )
+    assert flows == {_date(2026, 6, 2): pytest.approx(1_080.0)}
+
+
+def test_external_flows_passes_through_base_currency_rows_unchanged() -> None:
+    """A base-currency row with no usable rate is summed at face value.
+
+    Covers both shapes a single-currency book produces: no FxRateToBase column at
+    all, and the column present but null.
+    """
+    from datetime import date as _date
+
+    no_column = external_flows_from_cash(_flow_cash_table([_D2], [5_000.0]))
+    null_rate = external_flows_from_cash(
+        _flow_cash_table([_D2], [5_000.0], currencies=["USD"], rates=[None])
+    )
+    assert no_column == {_date(2026, 6, 2): pytest.approx(5_000.0)}
+    assert null_rate == no_column
+
+
+def test_external_flows_null_currency_is_treated_as_base() -> None:
+    """A row with no Currency at all keeps today's behaviour: summed as-is."""
+    from datetime import date as _date
+
+    flows = external_flows_from_cash(
+        _flow_cash_table([_D2], [5_000.0], currencies=[None], rates=[None])
+    )
+    assert flows == {_date(2026, 6, 2): pytest.approx(5_000.0)}
+
+
+def test_external_flows_skips_foreign_rows_with_no_rate_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unconvertible foreign row is dropped with a WARNING, never summed raw.
+
+    Adding a 1,000 EUR magnitude to a USD flow total states a wrong number with
+    full confidence. Dropping it leaves the period's return over-attributed to
+    trading by an amount the log names.
+    """
+    import logging
+
+    from datetime import date as _date
+
+    table = _flow_cash_table(
+        [_D2, _D2], [1_000.0, 500.0], currencies=["EUR", "USD"], rates=[None, None]
+    )
+    with caplog.at_level(logging.WARNING, logger="ibda.analytics.performance"):
+        flows = external_flows_from_cash(table)
+
+    # Only the USD row survives; the EUR magnitude is NOT added in.
+    assert flows == {_date(2026, 6, 2): pytest.approx(500.0)}
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("EUR" in m and "1000.0" in m for m in messages), (
+        f"expected a WARNING naming the currency and amount; got: {messages}"
+    )
+    assert any("2026-06-02" in m for m in messages), (
+        f"expected the warning to name the date; got: {messages}"
+    )
+
+
+def test_external_flows_base_currency_is_configurable() -> None:
+    """A non-USD base account converts the other way round."""
+    from datetime import date as _date
+
+    table = _flow_cash_table(
+        [_D2, _D2], [1_000.0, 500.0], currencies=["EUR", "USD"], rates=[None, None]
+    )
+    flows = external_flows_from_cash(table, base_currency="eur")
+    # EUR is now base and passes through; the USD row is the unconvertible one.
+    assert flows == {_date(2026, 6, 2): pytest.approx(1_000.0)}
+
+
+def test_external_flows_ignores_a_nonpositive_rate() -> None:
+    """A 0.0 or negative rate is not a rate; it must not zero out or flip a flow."""
+    from datetime import date as _date
+
+    zero = external_flows_from_cash(
+        _flow_cash_table([_D2], [5_000.0], currencies=["USD"], rates=[0.0])
+    )
+    assert zero == {_date(2026, 6, 2): pytest.approx(5_000.0)}
 
 
 def test_extended_risk_metrics() -> None:

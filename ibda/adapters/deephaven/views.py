@@ -382,13 +382,22 @@ def enrich_position_with_marks(position_view: Any, portfolio_raw: Any) -> Any:
     MarketPrice, MarketValue, and UnrealizedPnl populated from ``accounts_portfolio``
     for matching ConIds (null for non-matching ConIds).
     """
-    # Step 1: deduplicate to the latest mark per contract.
-    marks = portfolio_raw.last_by(["ContractId"])
+    # Step 1: deduplicate to the latest mark per (account, contract).
+    #
+    # Account is part of the key, not just ContractId. A contract held in more than one
+    # account produces one mark row per account, and keying on the contract alone keeps
+    # only the last of them — every other account's position then joins to a mark that
+    # belongs to a different account, and MarketValue is attributed to the wrong one.
+    # The position spec sourced from the same raw table already dedupes on
+    # ``["Account", "ConId"]``; this path is the outlier.
+    marks = portfolio_raw.last_by(["Account", "ContractId"])
 
-    # Step 2: select only the three mark columns with canonical naming/casing.
+    # Step 2: select the mark columns with canonical naming/casing, keeping Account so
+    # it can be part of the join key.
     # "UnrealizedPnl=UnrealizedPnL" renames raw UnrealizedPnL (capital L) to
     # canonical UnrealizedPnl so the natural_join populates the correct column.
     marks = marks.view([
+        "Account",
         "ConId=ContractId",
         "MarketPrice",
         "MarketValue",
@@ -401,8 +410,11 @@ def enrich_position_with_marks(position_view: Any, portfolio_raw: Any) -> Any:
     enriched = position_view.drop_columns(["MarketPrice", "MarketValue", "UnrealizedPnl"])
 
     # Step 4: left join — all position rows kept; right columns null on no match.
+    # Account is a join KEY, not a joined column — it is already on the left side.
     enriched = enriched.natural_join(
-        marks, on="ConId", joins=["MarketPrice", "MarketValue", "UnrealizedPnl"]
+        marks,
+        on=["Account", "ConId"],
+        joins=["MarketPrice", "MarketValue", "UnrealizedPnl"],
     )
 
     return enriched

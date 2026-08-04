@@ -29,9 +29,19 @@ Preferred: ``ibExecID`` attribute (native IB execution id).
 Fallback:  ``tradeID`` attribute.
 Synthetic: ``"{symbol}-{dateTime}-{quantity}-{tradePrice}"`` when both are absent.
 The synthetic id is deterministic given the same Flex report.
+
+TxnId source (cash rows)
+------------------------
+Preferred: ``transactionID`` attribute, emitted only when the Flex query
+definition selects that field.
+Synthetic: a ``syn-`` prefixed content hash of the canonical row, used for every
+transfer row and for any cash row IBKR did not identify. It is deterministic, so
+the same movement gets the same id from any report containing it — but it is a
+fingerprint, not an identity. See :func:`_synthetic_cash_id`.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -45,9 +55,14 @@ logger = logging.getLogger(__name__)
 # Override this constant if the account is configured to a different timezone.
 _FLEX_TZ: ZoneInfo = ZoneInfo("America/New_York")
 
+# Marks a cash TxnId that this adapter derived from row content rather than one
+# IBKR supplied. Keeping the two visibly distinct matters: an IBKR transactionID
+# is an identity, a derived id is only a content fingerprint.
+_SYNTHETIC_CASH_ID_PREFIX: str = "syn-"
 
-def _parse_dt(date_time: str | None) -> datetime:
-    """Parse a Flex dateTime string to a UTC-aware datetime.
+
+def _parse_dt_or_none(date_time: str | None) -> datetime | None:
+    """Parse a Flex dateTime string to a UTC-aware datetime, or ``None``.
 
     Accepted formats (tried in order):
 
@@ -65,15 +80,16 @@ def _parse_dt(date_time: str | None) -> datetime:
     Formats without an offset are localized to ``_FLEX_TZ`` (America/New_York)
     then converted to UTC so all Timestamp columns are comparable.
 
-    Empty / None input returns the UTC epoch without logging (field absent is expected).
-    Non-empty unparseable input returns the UTC epoch AND logs a WARNING, including
-    the raw value, so silent substitutions surface in structured logs.
+    Returns ``None`` — silently, with no substitute value — for input that is
+    absent, blank, or in none of the accepted formats. This is the form callers
+    use when an unusable timestamp means the row must be dropped rather than
+    anchored somewhere arbitrary; :func:`_parse_dt` is the substituting form.
 
     The America/New_York assumption matches IBKR's Flex default for US accounts.
     See ``_FLEX_TZ`` to change it.
     """
     if not date_time:
-        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+        return None
     dt_str = date_time.strip()
     for fmt in (
         "%Y-%m-%dT%H:%M:%S.%f%z",  # ISO with sub-seconds + offset e.g. "2026-06-02T10:31:00.123456-04:00"
@@ -88,18 +104,81 @@ def _parse_dt(date_time: str | None) -> datetime:
     ):
         try:
             dt_obj = datetime.strptime(dt_str, fmt)
-            if dt_obj.tzinfo is not None:
-                # Format included an explicit UTC offset — convert directly.
-                return dt_obj.astimezone(timezone.utc)
-            # No offset in the format — localize to _FLEX_TZ then convert to UTC.
-            return dt_obj.replace(tzinfo=_FLEX_TZ).astimezone(timezone.utc)
         except ValueError:
             continue
-    # Last-resort: return epoch and emit a WARNING so the caller can filter bad rows.
-    logger.warning(
-        "_parse_dt: could not parse dateTime %r — substituting 1970 epoch", date_time
-    )
+        if dt_obj.tzinfo is not None:
+            # Format included an explicit UTC offset — convert directly.
+            return dt_obj.astimezone(timezone.utc)
+        # No offset in the format — localize to _FLEX_TZ then convert to UTC.
+        return dt_obj.replace(tzinfo=_FLEX_TZ).astimezone(timezone.utc)
+    return None
+
+
+def _parse_dt(date_time: str | None) -> datetime:
+    """Parse a Flex dateTime string to a UTC-aware datetime, substituting the epoch.
+
+    The substituting form of :func:`_parse_dt_or_none` — same accepted formats and
+    same timezone handling, but an unusable value yields the UTC epoch instead of
+    ``None`` so the caller always receives a datetime.
+
+    Empty / None input returns the UTC epoch without logging (field absent is expected).
+    Non-empty unparseable input returns the UTC epoch AND logs a WARNING, including
+    the raw value, so silent substitutions surface in structured logs.
+
+    Substituting the epoch attributes the row to 1970-01-01, a day no NAV series
+    covers. Callers for whom that is a fabricated value rather than a harmless
+    placeholder — anything whose Timestamp decides which period a money movement
+    belongs to — should call :func:`_parse_dt_or_none` and drop the row instead.
+    """
+    parsed = _parse_dt_or_none(date_time)
+    if parsed is not None:
+        return parsed
+    if date_time:
+        # Distinguish a genuine parse failure from a legitimately absent field:
+        # only the former is worth a warning.
+        logger.warning(
+            "_parse_dt: could not parse dateTime %r — substituting 1970 epoch", date_time
+        )
     return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _synthetic_cash_id(row: Mapping[str, Any]) -> str:
+    """Derive a deterministic id for a canonical cash row from its own content.
+
+    IBKR does not always give a cash movement an identifier: ``transactionID`` is
+    emitted only when the Flex query definition selects that field, and nothing
+    else on a ``<CashTransaction>`` or ``<Transfer>`` element is guaranteed unique.
+    So when there is no real id this hashes the six canonical fields that describe
+    the movement — ``Account``, ``Timestamp``, ``Type``, ``Sym``, ``Amount``,
+    ``Currency`` — into a stable string, prefixed :data:`_SYNTHETIC_CASH_ID_PREFIX`.
+
+    What this does guarantee: the same movement, mapped from any report that
+    contains it, yields the same id. That is what lets an overlapping re-ingest be
+    de-duplicated instead of double-counted, and it is reproducible from the
+    canonical row alone — no parser state is folded in.
+
+    What it does NOT guarantee: uniqueness. Two genuinely separate movements that
+    agree on all six fields (say the same fee charged twice on a date-only stamp)
+    hash to one id and cannot be told apart. A content fingerprint is the strongest
+    identity the data supports when IBKR supplies none; select ``transactionID`` in
+    the Flex query to get a real one.
+    """
+    ts: Any = row.get("Timestamp")
+    amount: Any = row.get("Amount")
+    parts: list[str] = [
+        str(row.get("Account") or ""),
+        ts.isoformat() if isinstance(ts, datetime) else "",
+        str(row.get("Type") or ""),
+        str(row.get("Sym") or ""),
+        # repr() of a float round-trips exactly and is stable across runs, so the
+        # same amount never hashes two ways.
+        repr(float(amount)) if amount is not None else "",
+        str(row.get("Currency") or ""),
+    ]
+    digest = hashlib.sha1(
+        "|".join(parts).encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
+    return f"{_SYNTHETIC_CASH_ID_PREFIX}{digest[:16]}"
 
 
 def _map_execution(trade: dict[str, Any]) -> dict[str, Any] | None:
@@ -220,30 +299,72 @@ def _map_execution(trade: dict[str, Any]) -> dict[str, Any] | None:
 def _map_cash(txn: dict[str, Any]) -> dict[str, Any] | None:
     """Map one parsed cash-transaction dict to a canonical cash row dict.
 
-    Returns ``None`` when ``amount`` is absent — the CASH schema declares
-    ``Amount`` ``nullable=False``, so substituting 0.0 would fabricate a
-    genuine (but bogus) zero-value cash movement rather than surface the gap.
-    The caller (:func:`flex_sections_to_canonical`) filters ``None`` results
-    and logs a warning, mirroring the ``_map_transfer`` pattern.
-    """
-    amount: float | None = txn.get("amount")
-    if amount is None:
-        return None
+    Returns ``None`` (and logs a WARNING) in two cases, both of which would
+    otherwise put a fabricated value into a money column:
 
+    * ``amount`` is absent — the CASH schema declares ``Amount``
+      ``nullable=False``, so substituting 0.0 would fabricate a genuine (but
+      bogus) zero-value cash movement rather than surface the gap.
+    * ``date_time`` is absent or unparseable — anchoring the row to the 1970
+      epoch invents a cash movement on a day no NAV series covers, so the
+      movement is silently dropped from flow-adjusted returns anyway. Dropping
+      the row makes that loss countable and logged instead of invisible.
+
+    A date that merely looks unusual is not affected: any value the accepted
+    Flex formats can parse is kept, including a legitimate 1970-01-01 stamp.
+
+    The caller (:func:`flex_sections_to_canonical`) filters ``None`` results and
+    counts the two causes separately, mirroring the ``_map_transfer`` pattern.
+    """
     # Account: empty string -> None
     account_raw: str = txn.get("account") or ""
     account: str | None = account_raw if account_raw else None
 
+    amount: float | None = txn.get("amount")
+    if amount is None:
+        logger.warning(
+            "_map_cash: dropping cash row with no Amount "
+            "(Account=%r Type=%r Sym=%r DateTime=%r) — a 0.0 substitution would "
+            "fabricate a zero-value cash movement",
+            account,
+            txn.get("type"),
+            txn.get("symbol"),
+            txn.get("date_time"),
+        )
+        return None
+
+    timestamp: datetime | None = _parse_dt_or_none(txn.get("date_time"))
+    if timestamp is None:
+        logger.warning(
+            "_map_cash: dropping cash row with an unusable Timestamp "
+            "(Account=%r DateTime=%r Type=%r Amount=%r) — anchoring it to the 1970 "
+            "epoch would attribute a real cash movement to a day no NAV series "
+            "covers, losing it from flow-adjusted returns without a trace",
+            account,
+            txn.get("date_time"),
+            txn.get("type"),
+            amount,
+        )
+        return None
+
     symbol: str | None = txn.get("symbol") or None
 
-    return {
+    row: dict[str, Any] = {
+        "TxnId": "",  # filled in below, once the identifying fields are settled
         "Account": account,
-        "Timestamp": _parse_dt(txn.get("date_time")),
+        "Timestamp": timestamp,
         "Type": txn.get("type") or "",
         "Sym": symbol,
+        # Amount and Currency stay the LOCAL pair. Converting to base here would
+        # emit a base-currency magnitude under a local-currency label, which is
+        # the internally-inconsistent row shape this column exists to avoid;
+        # FxRateToBase carries the conversion instead, for consumers that need it.
         "Amount": float(amount),
         "Currency": txn.get("currency"),
+        "FxRateToBase": txn.get("fxRateToBase"),
     }
+    row["TxnId"] = txn.get("transaction_id") or _synthetic_cash_id(row)
+    return row
 
 
 def _map_nav(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -298,8 +419,12 @@ def _map_transfer(t: dict[str, Any]) -> dict[str, Any] | None:
 
     Where it is absent we cannot tell "single-currency account, rate is 1" from "missing
     rate on a cross-currency row", so the base value is used as-is — preserving existing
-    behaviour — and a warning is logged naming the risk. On an all-USD book (every fixture
-    today) base == local and nothing changes either way.
+    behaviour — and a warning is logged naming the risk. On a single-currency book
+    base == local and nothing changes either way.
+
+    The rate itself is carried on the emitted row as ``FxRateToBase`` (``None`` when
+    IBKR did not supply one), so a consumer that must aggregate in base currency can
+    convert rather than re-deriving the rate or assuming it is 1.
 
     The sign follows ``direction``:
     * ``"IN"`` (or absent/unknown) → +magnitude (asset received)
@@ -357,14 +482,24 @@ def _map_transfer(t: dict[str, Any]) -> dict[str, Any] | None:
     account_raw: str | None = t.get("account")
     account: str | None = account_raw if account_raw else None
 
-    return {
+    row: dict[str, Any] = {
+        "TxnId": "",  # filled in below, once the identifying fields are settled
         "Account": account,
         "Timestamp": _parse_dt(t.get("date_time")),
         "Type": "Transfer",
         "Sym": t.get("symbol") or None,
         "Amount": signed_amount,
         "Currency": t.get("currency") or None,
+        # The rate that converts this row's (local) Amount back to base. Every
+        # valuation source above yields a local magnitude — source 1 is divided by
+        # the rate precisely so it does — so the same rate applies to all of them.
+        "FxRateToBase": fx_rate_to_base,
     }
+    # A <Transfer> element carries no transactionID, so this is always synthetic —
+    # but it must still be populated: a cash table where transfers share a null id
+    # would collapse every transfer into one under a de-duplication pass.
+    row["TxnId"] = _synthetic_cash_id(row)
+    return row
 
 
 def flex_sections_to_canonical(
@@ -382,7 +517,9 @@ def flex_sections_to_canonical(
     -------
     dict with keys ``"execution"``, ``"cash"``, and ``"nav"``, each holding a
     list of row dicts keyed by canonical column names. ``"nav"`` is empty when
-    the Flex query did not include the daily equity summary section.
+    the Flex query did not include the daily equity summary section. Cash rows
+    (including transfers) are de-duplicated by ``TxnId`` — see
+    :func:`_dedupe_cash_rows` for what that does and does not guarantee.
     """
     trades: list[dict[str, Any]] = sections.get("trades") or []
     cash_txns: list[dict[str, Any]] = sections.get("cash") or []
@@ -397,17 +534,29 @@ def flex_sections_to_canonical(
         # _map_execution already logs a WARNING internally when it drops a row.
 
     cash_rows: list[dict[str, Any]] = []
+    dropped_missing_amount = 0
+    dropped_bad_timestamp = 0
     for c in cash_txns:
         mapped_cash = _map_cash(c)
         if mapped_cash is not None:
             cash_rows.append(mapped_cash)
+            continue
+        # _map_cash logs the per-row detail; classify here so the two causes stay
+        # separable in aggregate. A missing Amount is checked first there, so it
+        # is the reason whenever the amount is absent.
+        if c.get("amount") is None:
+            dropped_missing_amount += 1
         else:
-            logger.warning(
-                "Skipping cash row with missing Amount (Type=%r Sym=%r DateTime=%r)",
-                c.get("type"),
-                c.get("symbol"),
-                c.get("date_time"),
-            )
+            dropped_bad_timestamp += 1
+    if dropped_missing_amount or dropped_bad_timestamp:
+        logger.warning(
+            "Skipped %d cash row(s): %d with a missing Amount, %d with an unusable "
+            "Timestamp — these movements are absent from the canonical cash table "
+            "and therefore from flow-adjusted returns",
+            dropped_missing_amount + dropped_bad_timestamp,
+            dropped_missing_amount,
+            dropped_bad_timestamp,
+        )
 
     nav_rows_out: list[dict[str, Any]] = []
     for n in nav_rows:
@@ -443,6 +592,62 @@ def flex_sections_to_canonical(
 
     return {
         "execution": execution_rows,
-        "cash": cash_rows,
+        "cash": _dedupe_cash_rows(cash_rows),
         "nav": nav_rows_out,
     }
+
+
+def _dedupe_cash_rows(cash_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop repeat cash rows by ``TxnId``, keeping the first occurrence.
+
+    A single Flex response can carry the same movement more than once — most
+    obviously when it holds several ``<FlexStatement>`` blocks whose date ranges
+    overlap. Summing that table counts the movement twice, which moves money in
+    every downstream figure that reads it.
+
+    Two kinds of repeat are collapsed, and they carry different confidence:
+
+    * a repeated IBKR ``transactionID`` is the same transaction, full stop;
+    * a repeated ``syn-`` id means two rows agree on every field this adapter can
+      see. That is almost always the same movement reported twice — but it cannot
+      be distinguished from two real movements that happen to be identical, so the
+      warning says so and names the count.
+
+    This is where every consumer funnels through, so it is the one place the
+    de-duplication has to happen. It cannot span separate calls: loading two
+    overlapping reports one after another still yields the row twice, once per
+    call. What makes that case fixable is the id itself — it is derived only from
+    row content, so the two loads agree on it and a store can key on it.
+    """
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    repeat_ibkr_ids = 0
+    repeat_synthetic_ids = 0
+    for row in cash_rows:
+        txn_id: str = row["TxnId"]
+        if txn_id in seen:
+            if txn_id.startswith(_SYNTHETIC_CASH_ID_PREFIX):
+                repeat_synthetic_ids += 1
+            else:
+                repeat_ibkr_ids += 1
+            continue
+        seen.add(txn_id)
+        deduped.append(row)
+
+    if repeat_ibkr_ids:
+        logger.warning(
+            "Dropped %d duplicate cash row(s) sharing an IBKR transactionID — the "
+            "same transaction was reported more than once and would otherwise be "
+            "counted more than once",
+            repeat_ibkr_ids,
+        )
+    if repeat_synthetic_ids:
+        logger.warning(
+            "Dropped %d cash row(s) identical in Account/Timestamp/Type/Sym/Amount/"
+            "Currency to an earlier row. Keeping one avoids double-counting a "
+            "re-reported movement, but this report carries no transactionID, so "
+            "genuinely separate identical movements are indistinguishable from "
+            "duplicates here — select transactionID in the Flex query to resolve it",
+            repeat_synthetic_ids,
+        )
+    return deduped

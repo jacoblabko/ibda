@@ -488,7 +488,12 @@ def _multi_account_cash_table(day: dt.date) -> pa.Table:
     fixture, used there to prove ``performance_summary``/``sharpe_ratio`` derive
     flows for only the requested account -- applied here to the benchmark path.
     """
-    ts = dt.datetime.combine(day, dt.time(0, tzinfo=dt.timezone.utc))
+    # A market-hours stamp (10:00 ET), not midnight UTC: external_flows_from_cash
+    # buckets a cash row by its account-local calendar day, so a midnight-UTC stamp
+    # would denote the PREVIOUS local day and this fixture's intended flow date
+    # would depend on the bucketing rule rather than on the test's subject
+    # (account filtering). 14:00Z is the same calendar day in both zones.
+    ts = dt.datetime.combine(day, dt.time(14, tzinfo=dt.timezone.utc))
     return pa.table(
         {
             "Account": pa.array(["U1", "U2"], type=pa.string()),
@@ -615,7 +620,8 @@ def test_aligned_returns_single_account_port_unaffected_by_account_param() -> No
          "Total": v} for d, v in zip(days, values)
     ]
     nav = _nav_table(rows)
-    ts = dt.datetime.combine(days[1], dt.time(0, tzinfo=dt.timezone.utc))
+    # 10:00 ET — the same calendar day in both zones (see _multi_account_cash_table).
+    ts = dt.datetime.combine(days[1], dt.time(14, tzinfo=dt.timezone.utc))
     cash = pa.table(
         {
             "Account": pa.array(["U1"], type=pa.string()),

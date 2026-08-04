@@ -23,3 +23,6 @@ htmlcov/
 .vscode/
 .DS_Store
 *.swp
+
+# Locally built ibapi wheel (see SETUP.md step 1) — generated, never committed
+vendor/
