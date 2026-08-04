@@ -486,8 +486,14 @@ def build_account_view(overview_raw: Any, account: str | None = None) -> Any:
     -------
     A live deephaven Table with exactly the ``ACCOUNT`` canonical columns
     (Account, Timestamp, NetLiquidation, BuyingPower, MaintMargin,
-    GrossPositionValue, Currency, TotalCashValue), one row (zero until the
-    first matching update arrives), ticking thereafter.
+    GrossPositionValue, Currency, TotalCashValue), **one row per account**
+    (zero until the first matching update arrives), ticking thereafter.
+
+    With an ``account`` filter — the normal path — that is one row, as before.
+    Without one it is one row per account present, which is the corrected
+    behaviour: the previous ``last_by([])`` + constant-key join emitted a single
+    row whose five metrics could each have come from a different account. One
+    honest row per holder is the only answer that is not silently wrong.
     """
     tbl = overview_raw
     if account:
@@ -497,39 +503,54 @@ def build_account_view(overview_raw: Any, account: str | None = None) -> Any:
         # ALL rows were used rather than none).
         tbl = tbl.where(f"Account = `{account}`")
 
+    # Each metric is grouped BY ACCOUNT and joined on Account, not collapsed with
+    # `last_by([])` and joined on a constant `_k = 1`.
+    #
+    # The constant-key form is only correct when exactly one account is present. The
+    # filter above is deliberately skipped on a falsy `account` (supervisor account
+    # discovery failing yields ""), which is precisely the case where more than one
+    # account CAN be present -- and then each of the five metrics independently took
+    # whichever account pushed that key last. The result was one plausible row,
+    # labelled with the NetLiquidation row's Account, whose BuyingPower and
+    # MaintMargin could belong to a different holder: margin headroom computed across
+    # two accounts, with no error and no warning.
+    #
+    # This is the same defect, in the same file, as the enrich_position_with_marks fix
+    # -- `last_by(["ContractId"])` joined on `ConId` alone, so a contract held in two
+    # accounts attributed MarketValue to the wrong one. build_cash_balance_view
+    # already keys on ["Account", "Currency"]; this function was the outlier.
     def _metric(key: str, col: str) -> Any:
         return (
             tbl.where(f"Key = `{key}`")
-            .last_by([])
+            .last_by(["Account"])
             .view([
                 "Account",
                 "Currency",
                 "Timestamp = ReceiveTime",
                 f"{col} = DoubleValue",
             ])
-            .update_view("_k = (int)1")
         )
 
     net_liq = _metric("NetLiquidation", _ACCOUNT_METRIC_KEYS["NetLiquidation"])
     buying_power = _metric("BuyingPower", _ACCOUNT_METRIC_KEYS["BuyingPower"]).view(
-        ["_k", "BuyingPower"]
+        ["Account", "BuyingPower"]
     )
     maint_margin = _metric("MaintMarginReq", _ACCOUNT_METRIC_KEYS["MaintMarginReq"]).view(
-        ["_k", "MaintMargin"]
+        ["Account", "MaintMargin"]
     )
     gross_pos = _metric(
         "GrossPositionValue", _ACCOUNT_METRIC_KEYS["GrossPositionValue"]
-    ).view(["_k", "GrossPositionValue"])
+    ).view(["Account", "GrossPositionValue"])
     total_cash = _metric(
         "TotalCashValue", _ACCOUNT_METRIC_KEYS["TotalCashValue"]
-    ).view(["_k", "TotalCashValue"])
+    ).view(["Account", "TotalCashValue"])
 
     return (
         net_liq
-        .natural_join(buying_power, on="_k", joins=["BuyingPower"])
-        .natural_join(maint_margin, on="_k", joins=["MaintMargin"])
-        .natural_join(gross_pos, on="_k", joins=["GrossPositionValue"])
-        .natural_join(total_cash, on="_k", joins=["TotalCashValue"])
+        .natural_join(buying_power, on=["Account"], joins=["BuyingPower"])
+        .natural_join(maint_margin, on=["Account"], joins=["MaintMargin"])
+        .natural_join(gross_pos, on=["Account"], joins=["GrossPositionValue"])
+        .natural_join(total_cash, on=["Account"], joins=["TotalCashValue"])
         .view([
             "Account", "Timestamp", "NetLiquidation", "BuyingPower",
             "MaintMargin", "GrossPositionValue", "Currency", "TotalCashValue",

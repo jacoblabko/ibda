@@ -219,11 +219,16 @@ class TestCashFx:
         assert abs(self._row()["Price"] - 1.08520) < 1e-6
 
     def test_exec_id_synthetic_when_no_ids(self) -> None:
-        """No ibExecID and no tradeID → synthetic id; must be non-empty and embed symbol."""
+        """No ibExecID and no tradeID → synthetic id; must be non-empty and marked.
+
+        The synthetic form is a ``synx-`` prefixed content hash of
+        Account/Sym/DateTime/Qty/Price, not the old symbol-embedding string — see
+        ``_synthetic_exec_id`` for why the account had to be folded in and why the id
+        must not end in a price.
+        """
         exec_id = self._row()["ExecId"]
         assert exec_id  # non-empty
-        # Synthetic id is "{symbol}-{dateTime}-{qty}-{price}"; verify symbol embedded.
-        assert "EUR.USD" in exec_id
+        assert exec_id.startswith("synx-")
 
     def test_sec_type_is_cash(self) -> None:
         """CASH/FX rows carry SecType='CASH'."""
@@ -244,7 +249,7 @@ class TestCashFx:
     [
         ("NVDA", "0000e9bf.667fe2a3.01.01", False),       # ibExecID
         ("ESM6", "123456789", False),                      # tradeID fallback
-        ("EUR.USD", "EUR.USD-", True),                     # synthetic prefix
+        ("EUR.USD", "synx-", True),                        # synthetic prefix
     ],
 )
 def test_exec_id_fallback_chain(

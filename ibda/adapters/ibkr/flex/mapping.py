@@ -27,8 +27,11 @@ ExecId source
 -------------
 Preferred: ``ibExecID`` attribute (native IB execution id).
 Fallback:  ``tradeID`` attribute.
-Synthetic: ``"{symbol}-{dateTime}-{quantity}-{tradePrice}"`` when both are absent.
-The synthetic id is deterministic given the same Flex report.
+Synthetic: a ``synx-`` prefixed content hash of Account/Sym/DateTime/Qty/Price when
+both are absent. Deterministic, so the same fill gets the same id from any report
+containing it — which is what lets :func:`_dedupe_execution_rows` collapse the
+overlap between two ``<FlexStatement>`` blocks. It is a fingerprint, not an
+identity; see :func:`_synthetic_exec_id`.
 
 TxnId source (cash rows)
 ------------------------
@@ -59,6 +62,47 @@ _FLEX_TZ: ZoneInfo = ZoneInfo("America/New_York")
 # IBKR supplied. Keeping the two visibly distinct matters: an IBKR transactionID
 # is an identity, a derived id is only a content fingerprint.
 _SYNTHETIC_CASH_ID_PREFIX: str = "syn-"
+
+#: Same idea for executions. A ``<Trade>`` normally carries ``ibExecID`` (a real IBKR
+#: execution identity), but a Flex query that does not select it leaves this adapter
+#: to fabricate one — and a fabricated id must be visibly distinct from a real one,
+#: because :func:`_dedupe_execution_rows` reports the two confidences separately.
+_SYNTHETIC_EXEC_ID_PREFIX: str = "synx-"
+
+
+def _synthetic_exec_id(
+    *,
+    account: str | None,
+    symbol: str | None,
+    date_time: str | None,
+    quantity: float,
+    trade_price: float,
+) -> str:
+    """Content fingerprint for a ``<Trade>`` with no ``ibExecID`` / ``tradeID``.
+
+    Mirrors :func:`_synthetic_cash_id`: hash the fields that identify the fill into a
+    stable, prefixed string. ``account`` is included — its omission from the previous
+    string form is what made two accounts' identical fills collide — and the digest
+    form means the id can never end in ``.NN``, which ``reconcile.normalize_exec_id``
+    would strip.
+
+    Same guarantee and same limit as the cash equivalent: the same fill mapped from
+    any report yields the same id (which is what makes an overlapping re-ingest
+    de-duplicable), but two genuinely separate fills agreeing on every field hash to
+    one id and cannot be told apart. Select ``ibExecID`` in the Flex query to get a
+    real identity.
+    """
+    parts: list[str] = [
+        str(account or ""),
+        str(symbol or ""),
+        str(date_time or ""),
+        repr(float(quantity)),
+        repr(float(trade_price)),
+    ]
+    digest = hashlib.sha1(
+        "|".join(parts).encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
+    return f"{_SYNTHETIC_EXEC_ID_PREFIX}{digest[:16]}"
 
 
 def _parse_dt_or_none(date_time: str | None) -> datetime | None:
@@ -219,10 +263,31 @@ def _map_execution(trade: dict[str, Any]) -> dict[str, Any] | None:
             trade.get("exec_id"),
         )
 
-    # ExecId: prefer ibExecID > tradeID > synthetic
+    # ExecId: prefer ibExecID > tradeID > synthetic.
+    #
+    # The synthetic form is a `syn-` prefixed content hash, matching
+    # _synthetic_cash_id, and it is what makes _dedupe_execution_rows safe. The
+    # previous form -- f"{symbol}-{date_time}-{quantity}-{trade_price}" -- was wrong
+    # in two ways that only matter once executions are de-duplicated:
+    #
+    #   * it omitted `account`, so the SAME fill in two accounts produced byte-
+    #     identical ids and a dedupe pass would silently drop one account's fill;
+    #   * it ended in a price, and `reconcile.normalize_exec_id` strips a trailing
+    #     `\.\d{1,3}$`, so "AAPL-...-100-200.25" and "AAPL-...-100-200" normalise
+    #     together.
+    #
+    # It also carried no marker, so a consumer could not tell a fabricated id from a
+    # real ibExecID -- which is exactly the distinction the cash side uses to report
+    # its two dedupe confidences separately.
     exec_id: str = trade.get("exec_id") or ""
     if not exec_id:
-        exec_id = f"{symbol}-{date_time}-{quantity}-{trade_price}"
+        exec_id = _synthetic_exec_id(
+            account=trade.get("account"),
+            symbol=symbol,
+            date_time=date_time,
+            quantity=quantity,
+            trade_price=trade_price,
+        )
 
     # Qty: canonical is unsigned; Side carries direction
     qty_abs: float = abs(quantity)
@@ -379,9 +444,34 @@ def _map_nav(row: dict[str, Any]) -> dict[str, Any] | None:
     -100%-then-+inf daily return rather than surface the gap. The caller
     (:func:`flex_sections_to_canonical`) filters ``None`` results and logs a
     warning, mirroring the ``_map_transfer`` pattern.
+
+    Returns ``None`` **also** when ``report_date`` is unusable, for the same reason
+    and by the same rule :func:`_parse_dt` states in its own docstring: a caller
+    "whose Timestamp decides which period a money movement belongs to should call
+    :func:`_parse_dt_or_none` and drop the row instead". NAV is not merely such a
+    caller — it is the *denominator* of every return this adapter produces, so a
+    fabricated epoch row is the worst possible instance of that rule being broken.
+    ``_norm_date`` passes a non-``YYYYMMDD`` value through unchanged and an absent
+    ``reportDate`` does not even warn, so the substitution was silent: the row sorts
+    first in ``_nav_series``, becomes ``starting_nav``, and the 56-year gap counts as
+    one ordinary period. Measured on one otherwise-clean series, a single epoch row
+    moved annualised return from +87.47% to +52.04% with no error and no warning.
     """
     total: float | None = row.get("total")
     if total is None:
+        return None
+
+    timestamp: datetime | None = _parse_dt_or_none(row.get("report_date"))
+    if timestamp is None:
+        logger.warning(
+            "_map_nav: dropping NAV row with an unusable Timestamp "
+            "(Account=%r ReportDate=%r Total=%r) — anchoring the DENOMINATOR of "
+            "every return to the 1970 epoch silently rewrites the whole performance "
+            "series rather than losing one row",
+            row.get("account"),
+            row.get("report_date"),
+            total,
+        )
         return None
 
     account_raw: str = row.get("account") or ""
@@ -392,7 +482,7 @@ def _map_nav(row: dict[str, Any]) -> dict[str, Any] | None:
 
     return {
         "Account": account,
-        "Timestamp": _parse_dt(row.get("report_date")),
+        "Timestamp": timestamp,
         "Total": float(total),
         "Cash": float(cash) if cash is not None else None,
         "Stock": float(stock) if stock is not None else None,
@@ -482,10 +572,30 @@ def _map_transfer(t: dict[str, Any]) -> dict[str, Any] | None:
     account_raw: str | None = t.get("account")
     account: str | None = account_raw if account_raw else None
 
+    # Same rule as _map_cash, and it matters for the same reason: a transfer lands in
+    # the SAME canonical cash table, read by the SAME external_flows_from_cash. A
+    # transfer anchored to 1970 matches no NAV point, so it is never stripped from
+    # returns and the settlement day books the whole in-kind value as a trading gain.
+    # parse.py already anticipates all four date attributes being absent, so this is
+    # reachable, and _map_cash three functions up drops-and-logs on exactly this input.
+    timestamp: datetime | None = _parse_dt_or_none(t.get("date_time"))
+    if timestamp is None:
+        logger.warning(
+            "_map_transfer: dropping transfer with an unusable Timestamp "
+            "(Account=%r Sym=%r DateTime=%r Amount=%r) — a 1970-anchored transfer is "
+            "never stripped from returns, so the settlement day would report the "
+            "in-kind value as a trading gain",
+            account,
+            t.get("symbol"),
+            t.get("date_time"),
+            signed_amount,
+        )
+        return None
+
     row: dict[str, Any] = {
         "TxnId": "",  # filled in below, once the identifying fields are settled
         "Account": account,
-        "Timestamp": _parse_dt(t.get("date_time")),
+        "Timestamp": timestamp,
         "Type": "Transfer",
         "Sym": t.get("symbol") or None,
         "Amount": signed_amount,
@@ -591,10 +701,68 @@ def flex_sections_to_canonical(
             )
 
     return {
-        "execution": execution_rows,
+        "execution": _dedupe_execution_rows(execution_rows),
         "cash": _dedupe_cash_rows(cash_rows),
         "nav": nav_rows_out,
     }
+
+
+def _dedupe_execution_rows(execution_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop repeat execution rows by ``ExecId``, keeping the first occurrence.
+
+    The cash side has been de-duplicated since overlapping ``<FlexStatement>`` blocks
+    became reachable; executions were not, though the argument is identical and the
+    consequence is larger. ``parse_statement`` deliberately concatenates **all**
+    statement blocks, so a report holding ranges 06-01→06-03 and 06-02→06-04 carries
+    every fill in the overlap twice. Nothing downstream de-duplicated it, so Qty,
+    Commission and RealizedPnl all doubled — reproduced: one fill of 100 AAPL @ 200
+    (comm −1.00, realised 50.00) summed to 200 / −2.00 / 100.00.
+
+    Safe because IBKR gives partial fills of one order **distinct** ``ibExecID``s
+    (``…01.01``, ``…02.01``), and ``parse.py`` already filters to
+    ``levelOfDetail="EXECUTION"`` so ORDER/CLOSED_LOT aggregate siblings never reach
+    here. A repeated ExecId is therefore the same fill reported twice, not two fills.
+
+    Note this is the opposite policy from the **live** execution stream, where
+    ``ibda/tests_jvm/test_views.py`` asserts the spec must never carry
+    ``dedupe_keys`` because that table is an event log. The difference is the source,
+    not the schema: a live stream delivers each execution once by construction,
+    whereas a Flex report is a re-queryable document whose blocks can overlap by
+    design. De-duplicating the event log would hide real re-fires; not
+    de-duplicating the document double-counts money.
+    """
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    repeat_ibkr_ids = 0
+    repeat_synthetic_ids = 0
+    for row in execution_rows:
+        exec_id: str = str(row.get("ExecId") or "")
+        if exec_id and exec_id in seen:
+            if exec_id.startswith(_SYNTHETIC_EXEC_ID_PREFIX):
+                repeat_synthetic_ids += 1
+            else:
+                repeat_ibkr_ids += 1
+            continue
+        if exec_id:
+            seen.add(exec_id)
+        deduped.append(row)
+
+    if repeat_ibkr_ids:
+        logger.warning(
+            "Dropped %d duplicate execution row(s) sharing an IBKR ibExecID — the "
+            "same fill was reported more than once (overlapping <FlexStatement> "
+            "ranges) and would otherwise double Qty, Commission and RealizedPnl",
+            repeat_ibkr_ids,
+        )
+    if repeat_synthetic_ids:
+        logger.warning(
+            "Dropped %d execution row(s) identical in Account/Sym/DateTime/Qty/Price "
+            "to an earlier row. This report carries no ibExecID, so two genuinely "
+            "separate identical fills are indistinguishable from a duplicate here — "
+            "select ibExecID in the Flex query to resolve it",
+            repeat_synthetic_ids,
+        )
+    return deduped
 
 
 def _dedupe_cash_rows(cash_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

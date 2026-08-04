@@ -100,12 +100,47 @@ def test_execution_sell_qty_is_unsigned() -> None:
 
 
 def test_execution_synthetic_exec_id_when_absent() -> None:
-    """Fixture has no ibExecID/tradeID, so a deterministic synthetic id is used."""
+    """Fixture has no ibExecID/tradeID, so a deterministic synthetic id is used.
+
+    The id is a ``synx-`` prefixed content hash rather than the old
+    ``"{symbol}-{dateTime}-{quantity}-{tradePrice}"`` string. The string form embedded
+    the symbol and so read nicely, but it omitted the ACCOUNT — which made two
+    accounts' identical fills collide the moment executions started being
+    de-duplicated — and it ended in a price, which ``reconcile.normalize_exec_id``
+    strips as a trailing ``.NN``. The marker also lets ``_dedupe_execution_rows``
+    report fabricated-id collapses separately from real ibExecID ones.
+    """
     canon = flex_sections_to_canonical(_sections())
     for row in canon["execution"]:
         assert row["ExecId"]  # non-empty
-        # Synthetic id should embed the symbol so it's recognisable.
-        assert "AAPL" in row["ExecId"]
+        assert row["ExecId"].startswith("synx-"), (
+            "a fabricated ExecId must be marked so it is distinguishable from a real "
+            f"ibExecID; got {row['ExecId']!r}"
+        )
+
+
+def test_synthetic_exec_id_is_deterministic_and_account_scoped() -> None:
+    """The two properties the dedupe pass depends on.
+
+    Deterministic, or an overlapping re-ingest cannot be collapsed. Account-scoped, or
+    collapsing it would silently drop one account's copy of a fill both accounts made.
+    """
+    from ibda.adapters.ibkr.flex.mapping import _synthetic_exec_id
+
+    def _mk(account: str) -> str:
+        return _synthetic_exec_id(
+            account=account,
+            symbol="AAPL",
+            date_time="20260602;103100",
+            quantity=100.0,
+            trade_price=200.0,
+        )
+
+    assert _mk("U111") == _mk("U111"), "the same fill must always hash to the same id"
+    assert _mk("U111") != _mk("U222"), (
+        "two accounts' identical fills must NOT collide — that is what made the old "
+        "string form unsafe to de-duplicate"
+    )
 
 
 def test_parse_trades_extracts_order_reference_and_open_close() -> None:
@@ -1687,3 +1722,109 @@ def test_map_transfer_normal_in_out_does_not_log_warning(
         if r.levelno >= logging.WARNING and "direction" in r.message
     ]
     assert not direction_warnings, f"unexpected direction WARNING: {direction_warnings}"
+
+
+# ---------------------------------------------------------------------------
+# Overlapping <FlexStatement> blocks
+#
+# parse_statement deliberately concatenates ALL statement blocks, which makes
+# overlapping date ranges reachable — the exact condition _dedupe_cash_rows was written
+# for. The identical argument applies to <Trade> elements, and executions were never
+# deduped, so every fill in an overlap doubled Qty, Commission and RealizedPnl.
+# ---------------------------------------------------------------------------
+
+
+def test_a_fill_reported_by_two_overlapping_statements_is_counted_once() -> None:
+    from ibda.adapters.ibkr.flex.mapping import _dedupe_execution_rows
+
+    def _row(exec_id: str) -> dict[str, object]:
+        return {
+            "ExecId": exec_id, "Account": "U111", "Sym": "AAPL", "Side": "BUY",
+            "Qty": 100.0, "Price": 200.0, "Commission": -1.0, "RealizedPnl": 50.0,
+        }
+
+    deduped = _dedupe_execution_rows([_row("0000e0d5.1"), _row("0000e0d5.1")])
+
+    assert len(deduped) == 1, "the same ibExecID reported twice must collapse to one fill"
+    assert sum(float(r["Qty"]) for r in deduped) == 100.0
+    assert sum(float(r["Commission"]) for r in deduped) == -1.0
+    assert sum(float(r["RealizedPnl"]) for r in deduped) == 50.0
+
+
+def test_the_canonical_mapper_actually_applies_the_execution_dedupe() -> None:
+    """End-to-end through flex_sections_to_canonical, not the helper in isolation.
+
+    Written this way deliberately: a test that calls _dedupe_execution_rows directly
+    still passes when the call is removed from the return dict, which is exactly the
+    regression that matters. The overlap is simulated by duplicating the parsed trades,
+    which is what concatenating two overlapping <FlexStatement> blocks produces.
+    """
+    sections = _sections()
+    baseline = len(flex_sections_to_canonical(sections)["execution"])
+
+    overlapped = dict(sections)
+    overlapped["trades"] = list(sections["trades"]) + list(sections["trades"])
+    canon = flex_sections_to_canonical(overlapped)
+
+    assert len(canon["execution"]) == baseline, (
+        "duplicating the trades (an overlapping statement range) changed the canonical "
+        f"execution row count from {baseline} to {len(canon['execution'])} — the dedupe "
+        "is not wired into flex_sections_to_canonical"
+    )
+    exec_ids = [r["ExecId"] for r in canon["execution"]]
+    assert len(exec_ids) == len(set(exec_ids))
+
+
+def test_partial_fills_of_one_order_are_not_collapsed() -> None:
+    """The safety condition for the dedupe above.
+
+    IBKR gives each partial fill of an order a DISTINCT ibExecID (`…01.01`, `…02.01`),
+    and parse.py filters to levelOfDetail="EXECUTION" so ORDER/CLOSED_LOT aggregate
+    siblings never reach the mapper. If either were untrue, de-duplicating by ExecId
+    would delete real fills.
+    """
+    from ibda.adapters.ibkr.flex.mapping import _dedupe_execution_rows
+
+    rows = [
+        {"ExecId": "0000e0d5.01.01", "Qty": 40.0},
+        {"ExecId": "0000e0d5.02.01", "Qty": 60.0},
+    ]
+    assert len(_dedupe_execution_rows(rows)) == 2
+    assert sum(float(r["Qty"]) for r in _dedupe_execution_rows(rows)) == 100.0
+
+
+# ---------------------------------------------------------------------------
+# 1970-epoch anchoring
+#
+# _parse_dt's own docstring states the rule: a caller "whose Timestamp decides which
+# period a money movement belongs to" must use _parse_dt_or_none and drop the row.
+# _map_cash follows it; _map_nav and _map_transfer did not.
+# ---------------------------------------------------------------------------
+
+
+def test_a_nav_row_with_an_unparseable_date_is_dropped_not_anchored_to_1970() -> None:
+    """NAV is the DENOMINATOR of every return, so an epoch row rewrites the series.
+
+    _nav_series sorts ascending, so the fabricated 1970 row lands first and becomes
+    starting_nav; the 56-year gap then counts as one ordinary period.
+    """
+    from ibda.adapters.ibkr.flex.mapping import _map_nav
+
+    assert _map_nav({"account": "U111", "report_date": "20260602", "total": 1000.0}) is not None
+    assert _map_nav({"account": "U111", "report_date": "06/02/2026", "total": 1000.0}) is None
+    assert _map_nav({"account": "U111", "report_date": None, "total": 1000.0}) is None
+
+
+def test_a_transfer_with_an_unparseable_date_is_dropped_not_anchored_to_1970() -> None:
+    """A transfer keyed to 1970 matches no NAV point, so it is never stripped from
+    returns and the settlement day books the in-kind value as a trading gain."""
+    from ibda.adapters.ibkr.flex.mapping import _map_transfer
+
+    base: dict[str, object] = {
+        "kind": "transfer", "account": "U111", "symbol": "AAPL", "direction": "IN",
+        "quantity": None, "positionAmount": None, "positionAmountInBase": 50000.0,
+        "transferPrice": None, "cashTransfer": None, "currency": "USD",
+    }
+    assert _map_transfer({**base, "date_time": "20260602"}) is not None
+    assert _map_transfer({**base, "date_time": "not-a-date"}) is None
+    assert _map_transfer({**base, "date_time": None}) is None

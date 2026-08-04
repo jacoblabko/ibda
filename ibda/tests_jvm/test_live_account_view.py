@@ -246,3 +246,73 @@ def test_cash_balance_view_is_live() -> None:
         return bool(port.table("cash_balance").snapshot().num_rows == 3)
 
     assert _poll_until(_has_three_rows), "cash_balance view did not re-tick on a new currency row"
+
+
+# ---------------------------------------------------------------------------
+# Cross-account attribution
+#
+# Every other test in this file passes account="DU1", so none of them could observe
+# the defect: build_account_view reduced each of its five metrics with `last_by([])`
+# — no group-by — and joined them on a constant `_k = 1`. With more than one account
+# present, each metric independently took whichever account pushed that key last, and
+# the result was emitted as ONE row labelled with the NetLiquidation row's Account.
+#
+# That path is reachable by design, not by accident: supervisor account discovery
+# yields "" when accounts_managed is empty or unreadable, live.py passes it through,
+# and build_account_view treats "" as falsy and skips the filter deliberately (it
+# mirrors the old canonical_account_snapshot degradation). So the unfiltered,
+# multi-account case is exactly the degraded-discovery case.
+#
+# Same defect, same file, as the enrich_position_with_marks fix: `last_by` keyed on
+# too few columns, so a value was attributed to the wrong holder.
+# ---------------------------------------------------------------------------
+
+
+def test_two_accounts_do_not_have_their_metrics_mixed_into_one_row() -> None:
+    """Unfiltered, each account must get its own row with its own five metrics."""
+    from deephaven.time import to_j_instant
+
+    dtw = _make_overview_writer()
+    t0 = to_j_instant("2026-07-08T15:00:00 UTC")
+
+    # U_A is written first, U_B second, so U_B is "last" for every key. Under the old
+    # constant-key join the single emitted row took U_A's Account label (whatever the
+    # NetLiquidation branch carried) beside U_B's BuyingPower and MaintMargin.
+    dtw.write_row(1, t0, "U_A", "BASE", "NetLiquidation", "", "", 1_000_000.0)
+    dtw.write_row(1, t0, "U_A", "BASE", "BuyingPower", "", "", 500_000.0)
+    dtw.write_row(1, t0, "U_A", "BASE", "MaintMarginReq", "", "", 20_000.0)
+    dtw.write_row(1, t0, "U_A", "BASE", "GrossPositionValue", "", "", 300_000.0)
+    dtw.write_row(1, t0, "U_A", "BASE", "TotalCashValue", "", "", 400_000.0)
+
+    dtw.write_row(1, t0, "U_B", "BASE", "NetLiquidation", "", "", 7.0)
+    dtw.write_row(1, t0, "U_B", "BASE", "BuyingPower", "", "", 8.0)
+    dtw.write_row(1, t0, "U_B", "BASE", "MaintMarginReq", "", "", 9.0)
+    dtw.write_row(1, t0, "U_B", "BASE", "GrossPositionValue", "", "", 10.0)
+    dtw.write_row(1, t0, "U_B", "BASE", "TotalCashValue", "", "", 11.0)
+
+    viewed = build_account_view(dtw.table)  # no account filter — the degraded path
+    port = ibda.connect({"account": viewed})
+
+    def _has_both() -> bool:
+        return bool(port.table("account").snapshot().num_rows == 2)
+
+    assert _poll_until(_has_both), (
+        "expected one row per account; got "
+        f"{port.table('account').snapshot().num_rows}"
+    )
+
+    rows = {r["Account"]: r for r in port.table("account").snapshot().to_pylist()}
+    assert set(rows) == {"U_A", "U_B"}
+
+    # The whole point: every metric on a row belongs to that row's account.
+    assert rows["U_A"]["NetLiquidation"] == 1_000_000.0
+    assert rows["U_A"]["BuyingPower"] == 500_000.0
+    assert rows["U_A"]["MaintMargin"] == 20_000.0
+    assert rows["U_A"]["GrossPositionValue"] == 300_000.0
+    assert rows["U_A"]["TotalCashValue"] == 400_000.0
+
+    assert rows["U_B"]["NetLiquidation"] == 7.0
+    assert rows["U_B"]["BuyingPower"] == 8.0
+    assert rows["U_B"]["MaintMargin"] == 9.0
+    assert rows["U_B"]["GrossPositionValue"] == 10.0
+    assert rows["U_B"]["TotalCashValue"] == 11.0
