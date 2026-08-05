@@ -26,3 +26,9 @@ htmlcov/
 
 # Locally built ibapi wheel (see SETUP.md step 1) — generated, never committed
 vendor/
+
+# uv resolution lockfile — generated, never committed. `ibda` is published as a
+# library, so it declares dependency ranges in pyproject.toml and leaves pinning to
+# the consuming application; a committed lock here would pin nothing that matters and
+# would go stale. Running any `uv` command in this checkout regenerates it.
+uv.lock
