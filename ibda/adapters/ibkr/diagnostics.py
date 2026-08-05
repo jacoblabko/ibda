@@ -83,8 +83,8 @@ class ErrorTier(enum.Enum):
       Delayed market data is available" — partial, with a delayed fallback.
 
     Both carry an explicit delayed-data clause — but **that clause is not the
-    test**, and must never be used as one. Live against TWS paper on 2026-08-04
-    a ``10089`` arrived reading, verbatim:
+    test**, and must never be used as one. Measured live against TWS paper, a
+    ``10089`` arrived reading, verbatim:
 
         "Requested market data requires additional subscription for API. See link
         in 'Market Data Connections' dialog for more details.**Delayed market data
