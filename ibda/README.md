@@ -3,8 +3,8 @@
 `ibda` is an engine-hidden, vendor-neutral data-access API over an IBKR account. It gives you
 canonical tables (`position`, `execution`, `nav`, ...) as Apache Arrow, from either a live TWS
 connection or an offline Flex Activity XML report. **Importing `ibda` never boots a compute
-engine** — the Deephaven engine (and, for live connections, the IBKR vendor SDK) is imported and
-started lazily, the first time you call a data-producing entry point.
+engine** — the [Deephaven](https://deephaven.io) engine (and, for live connections, the IBKR
+vendor SDK) is imported and started lazily, the first time you call a data-producing entry point.
 
 That "does this boot an engine?" distinction is the one thing to get right before reaching for an
 entry point — it's called out for each recipe below.
@@ -100,3 +100,13 @@ exception, since they are the canonical engine-free pairing.
 
 Every error `ibda` raises deliberately derives from `ibda.errors.IbdaError` (see `ibda/errors.py`):
 `FlexParseError` (malformed/not-ready/rejected Flex XML), `UnknownTable`, `SchemaMismatch`.
+
+## Built on Deephaven
+
+The engine behind every live, queryable table here is
+[Deephaven Community Core](https://github.com/deephaven/deephaven-core) (docs and downloads at
+[deephaven.io](https://deephaven.io)). The IBKR side is reached through
+[deephaven-ib](https://github.com/deephaven-examples/deephaven-ib), Deephaven's IBKR connector.
+
+`ibda` keeps both behind its port/adapter surface: you get `pyarrow.Table` out and never import
+Deephaven yourself, and the engine-free Flex path (Recipe 1) does not start it at all.

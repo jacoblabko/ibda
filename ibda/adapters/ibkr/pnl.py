@@ -43,6 +43,7 @@ Design notes
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, cast
 
 import pyarrow as pa
@@ -126,15 +127,41 @@ def _position_pnl_arrow_from_rows(
 
 
 def _f(val: Any) -> float | None:
-    """Cast a raw value to float, returning None for None/NaN sentinels."""
+    """Cast a raw value to float, returning ``None`` for every "no value" encoding.
+
+    Three encodings reach this function, and each of them must become ``None`` rather
+    than a number, because every consumer of these columns sums them:
+
+    - ``None`` — the column was absent from the row.
+    - ``NaN`` — what ``deephaven.pandas.to_pandas`` produces for a Deephaven null, which
+      is how these rows arrive (``supervisor.snapshot_raw_rows`` → ``to_pandas`` →
+      ``to_dict``). This branch was **missing**: the docstring promised it, the code did
+      not do it, and ``nan >= 1.797e308`` is ``False``, so a null P&L passed straight
+      through. One NaN poisons an entire ``sum()`` to NaN — a whole-book P&L reading
+      "nan" traced back to a single unavailable position.
+    - ``±Double.MAX_VALUE`` — IBKR's "not yet computed" sentinel. The magnitude test is
+      ``abs()`` because **IB emits it with either sign**; see ``map_null_value`` in the
+      vendored ``deephaven-ib`` fork (``_tws/ib_type_logger.py``), which states both have
+      been observed live and is the canonical rule this mirrors. The previous one-sided
+      ``>=`` let ``-Double.MAX_VALUE`` through as a real number roughly
+      ``-1.8e308`` — arithmetically catastrophic in a sum, and indistinguishable from a
+      genuine loss in a column of dollars.
+
+    Not shared with ``ibda/adapters/deephaven/views.py``'s DQL scrub, which correctly
+    uses a one-sided ``>=``: there the value stays inside the engine, where a null *is*
+    ``-Double.MAX_VALUE`` and must pass through untouched. The two tests differ because
+    the two representations differ — that is stated in both places so neither is
+    "corrected" to match the other.
+    """
     if val is None:
         return None
     try:
         result = float(val)
     except (TypeError, ValueError):
         return None
-    # IBKR uses Double.MAX_VALUE as a sentinel for "not yet available"
-    if result >= 1.7976931348623157e+308:
+    if math.isnan(result):
+        return None
+    if abs(result) >= 1.7976931348623157e+308:
         return None
     return result
 

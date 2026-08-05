@@ -10,6 +10,13 @@ account and wants Arrow tables instead of callback plumbing.
 Importing `ibda` never boots a compute engine — that happens lazily, on the first call that
 actually needs data.
 
+**Built on [Deephaven](https://deephaven.io).** The ticking-table engine underneath is
+[Deephaven Community Core](https://github.com/deephaven/deephaven-core), and the bridge from
+IBKR into it is [deephaven-ib](https://github.com/deephaven-examples/deephaven-ib), Deephaven's
+IBKR connector — used here as a patched fork (see [`DEPENDENCIES.md`](DEPENDENCIES.md)). `ibda`
+keeps both behind its port/adapter surface: you get `pyarrow.Table` out and never import
+Deephaven yourself, and the offline Flex path does not start the engine at all.
+
 ## Quickstart
 
 ### Offline, from a Flex Activity XML report (no TWS, no engine, no market-data subscription)

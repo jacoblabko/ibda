@@ -55,10 +55,47 @@ def test_f_double_max_sentinel_returns_none() -> None:
     assert _f(sentinel) is None
 
 
+def test_f_negative_double_max_sentinel_returns_none() -> None:
+    """IB emits the sentinel with EITHER sign — the one-sided test missed half of it.
+
+    ``deephaven-ib``'s own ``map_null_value`` records that both ``+Double.MAX_VALUE`` and
+    ``-Double.MAX_VALUE`` have been observed live and tests ``abs(value)``. Before this,
+    ``_f`` used ``result >= 1.797e308``, so the negative one arrived downstream as a real
+    number near ``-1.8e308`` and entered a column of dollars that gets summed.
+    """
+    assert _f(-1.7976931348623157e+308) is None
+
+
+def test_f_nan_returns_none() -> None:
+    """A Deephaven null arrives here as NaN, and one NaN poisons a whole sum.
+
+    These rows come from ``snapshot_raw_rows`` → ``deephaven.pandas.to_pandas`` →
+    ``to_dict``, and ``to_pandas`` renders a null float64 cell as NaN. ``_f``'s docstring
+    always claimed it returned ``None`` for NaN; the body never checked, and
+    ``nan >= 1.797e308`` is ``False``, so it passed through. A single unavailable
+    position then made the entire book's P&L read ``nan``.
+    """
+    assert _f(float("nan")) is None
+
+
 def test_f_large_but_not_sentinel() -> None:
-    # A very large but non-sentinel float should pass through.
+    # A very large but non-sentinel float should pass through — including negative,
+    # so the abs() guard above cannot be mistaken for "drop all large negatives".
     large = 1.0e+300
     assert _f(large) == pytest.approx(large)
+    assert _f(-large) == pytest.approx(-large)
+
+
+def test_f_infinity_is_not_swallowed_as_a_sentinel() -> None:
+    """Infinity is not IB's sentinel and must not be silently nulled.
+
+    ``abs(inf) >= 1.797e308`` is ``True``, so it takes the sentinel branch — which is the
+    right call (an infinite P&L is not a number to sum either) but is worth pinning, so a
+    future reader does not "fix" the guard into ``==`` and reintroduce a value that breaks
+    every aggregate it touches.
+    """
+    assert _f(float("inf")) is None
+    assert _f(float("-inf")) is None
 
 
 def test_f_bad_string_returns_none() -> None:

@@ -90,9 +90,16 @@ class IbkrTableSpec:
 
 
 # ---------------------------------------------------------------------------
-# Canonical specs (all five live-view tables)
-# NOTE: ``account`` is intentionally absent — it is a KEY-VALUE → wide PIVOT,
-# handled separately in supervisor.canonical_account_snapshot().
+# Canonical specs — the 14 spec-driven live-view tables.
+# NOTE: ``account`` and ``cash_balance`` are intentionally absent; both are
+# KEY-VALUE → wide PIVOTs over accounts_overview, hand-written in
+# adapters/deephaven/views.py (build_account_view / build_cash_balance_view)
+# and wired in adapters/ibkr/live.py. Those two plus these 14 are the 16
+# canonical views the live TWS path builds; the remaining canonical schemas
+# are ``cash``/``nav`` (Flex-only, adapters/ibkr/flex/loader.py) and ``book``
+# (defined but unwired; no market-depth feed).
+# (``supervisor.canonical_account_snapshot()`` is the older snapshot-grade
+# pivot, superseded for the live path by build_account_view.)
 # ---------------------------------------------------------------------------
 
 CANONICAL_SPECS: dict[str, IbkrTableSpec] = {
