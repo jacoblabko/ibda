@@ -490,7 +490,10 @@ def subscribe_atm_option(
         Underlying ticker (e.g. "AAPL").
     spot:
         Reference underlying price used to pick ATM strike candidates (e.g. the
-        latest IB/Databento close — no extra market-data line is spent to get it).
+        latest IB close already on hand — no extra market-data line is spent to
+        get it). This is a caller-supplied number: ``ibda`` reaches no non-IB data
+        source to obtain one, by design (see ``ibda.rates`` for the same rule
+        applied to the risk-free rate).
     min_dte:
         Minimum days-to-expiry for the chosen expiry.
     right:
