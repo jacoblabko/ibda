@@ -237,7 +237,57 @@ def _map_execution(trade: dict[str, Any]) -> dict[str, Any] | None:
     the ``_map_transfer`` pattern.
     """
     symbol: str = trade.get("symbol") or ""
+    # `parse.py` extracts BOTH dateTime and tradeDate, and this mapper used only the first.
+    # A Flex query whose Trades section selects Trade Date but not Date/Time therefore
+    # produced an empty `date_time`, and `_parse_dt` epoch-anchors an empty value WITHOUT a
+    # warning (it only warns when the input is truthy) -- so every fill silently landed on
+    # 1970-01-01. That is worse than a lost timestamp: `date_time` is also a hash input to
+    # the synthetic ExecId below, so with it empty the fingerprint lost all time resolution
+    # and two genuine same-day fills in the same name at the same price collapsed to one id
+    # -- the second was then DELETED by _dedupe_execution_rows. Shares and commission gone,
+    # and round-trip reconstruction (sorted by Timestamp) saw the survivors as a flip
+    # through zero, fabricating a short round-trip that never happened.
+    #
+    # Falling back to tradeDate restores day resolution for both the Timestamp and the
+    # fingerprint. Rows that carry dateTime are byte-unchanged, so existing synthetic ids
+    # are stable. Every sibling mapper (_map_cash, _map_nav, _map_transfer) was already
+    # migrated off the substituting parser for this reason; this was the one left behind,
+    # and an execution's Timestamp decides round-trip ordering, hold time, markout window
+    # and TCA scope.
     date_time: str = trade.get("date_time") or ""
+    if not date_time:
+        trade_date_only: str = trade.get("trade_date") or ""
+        if trade_date_only:
+            logger.warning(
+                "_map_execution: Trades row for %r has no dateTime; falling back to "
+                "tradeDate %r (day resolution only). Add Date/Time to the Flex query's "
+                "Trades section for intraday ordering, markouts and hold times.",
+                symbol,
+                trade_date_only,
+            )
+            date_time = trade_date_only
+
+    # ...and when NEITHER is present, drop the row rather than anchor it. The fallback
+    # above only fires when `tradeDate` exists; with both absent this still reached the
+    # substituting `_parse_dt` and produced exactly the 1970 fingerprint collapse the
+    # comment describes, silently -- `_parse_dt` warns only on truthy input, and the
+    # tradeDate warning needs a tradeDate. `_parse_dt`'s own docstring states the rule
+    # this now follows: a caller whose Timestamp decides which period a row belongs to
+    # must use the non-substituting form and drop instead. That is the whole sibling set
+    # (_map_cash, _map_nav, _map_transfer); this mapper is now genuinely among them.
+    timestamp: datetime | None = _parse_dt_or_none(date_time)
+    if timestamp is None:
+        logger.warning(
+            "_map_execution: dropping Trades row for %r with an unusable Timestamp "
+            "(dateTime=%r tradeDate=%r). Anchoring it to the epoch would collapse the "
+            "synthetic ExecId's time resolution and let _dedupe_execution_rows delete "
+            "genuine distinct fills.",
+            symbol,
+            trade.get("date_time"),
+            trade.get("trade_date"),
+        )
+        return None
+
     quantity: float | None = trade.get("quantity")
     trade_price: float | None = trade.get("trade_price")
 
@@ -341,7 +391,7 @@ def _map_execution(trade: dict[str, Any]) -> dict[str, Any] | None:
 
     return {
         "ExecId": exec_id,
-        "Timestamp": _parse_dt(date_time),
+        "Timestamp": timestamp,
         "Account": account,
         "ConId": con_id,
         "OrderId": order_id,
@@ -703,8 +753,56 @@ def flex_sections_to_canonical(
     return {
         "execution": _dedupe_execution_rows(execution_rows),
         "cash": _dedupe_cash_rows(cash_rows),
-        "nav": nav_rows_out,
+        "nav": _dedupe_nav_rows(nav_rows_out),
     }
+
+
+def _dedupe_nav_rows(nav_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop repeat NAV rows by ``(Account, Timestamp)``, keeping the first occurrence.
+
+    NAV was the only one of the three canonical Flex tables left un-de-duplicated, and it is
+    the one whose duplicates do the most damage. ``parse.py`` deliberately concatenates every
+    ``<FlexStatement>`` block in a response, so a report holding two blocks with overlapping
+    date ranges yields the same report date twice — the exact scenario
+    :func:`_dedupe_execution_rows` already names as reachable and reproduced for fills.
+
+    Nothing downstream compensated. ``analytics.performance._nav_series`` sorts but preserves
+    duplicates, so ``_dated_returns`` emitted an extra zero-length period per duplicated date
+    **and re-subtracted that date's external flow a second time** — a deposit stripped twice.
+    Measured on a two-statement report overlapping two days with one $5,000 deposit:
+    cumulative return −2.10% → −6.95%, max drawdown −4.00% → −8.75%, Sharpe −3.81 → −7.83.
+    Silent, in the direction of a worse-looking track record, with no error anywhere.
+
+    Two further reasons this is a defect and not a tolerated shape: ``ibda/schema/nav.py``
+    declares the contract "One row per report date", and ``analytics.benchmark._returns_by_date``
+    treats the identical input as *fatal* ("duplicate return date … ambiguous input"). So the
+    same table raised in ``relative_summary`` while silently mis-reporting in
+    ``performance_summary`` — the two disagreed about whether it was even valid.
+
+    Keying on ``(Account, Timestamp)`` rather than ``Timestamp`` alone keeps a genuine
+    multi-account consolidated report intact; ``performance_from_sections`` guards that case
+    separately.
+    """
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any]] = set()
+    repeats = 0
+    for row in nav_rows:
+        key = (row.get("Account"), row.get("Timestamp"))
+        if key in seen:
+            repeats += 1
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    if repeats:
+        logger.warning(
+            "Dropped %d duplicate NAV row(s) sharing an (Account, report date) — most often "
+            "two overlapping <FlexStatement> blocks in one response. Keeping one avoids both "
+            "a fabricated zero-length return period and double-subtracting that date's "
+            "external flow.",
+            repeats,
+        )
+    return deduped
 
 
 def _dedupe_execution_rows(execution_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

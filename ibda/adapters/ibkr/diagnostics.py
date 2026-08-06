@@ -52,7 +52,7 @@ class ErrorTier(enum.Enum):
     code.
     """
 
-    INFORMATIONAL = "informational"
+    INFORMATIONAL = "INFORMATIONAL"
     """System status notifications that require no action.
 
     Codes in the 2100–2169 band that are NOT degradation signals: "…connection
@@ -61,7 +61,7 @@ class ErrorTier(enum.Enum):
     INFO or drop entirely. Never abort or retry on these.
     """
 
-    CONNECTIVITY_DEGRADED = "connectivity_degraded"
+    CONNECTIVITY_DEGRADED = "CONNECTIVITY_DEGRADED"
     """A farm or TWS↔IB-server link has dropped — often transient.
 
     Specific codes: 2103, 2105, 2157 ("…connection is broken"), 2110
@@ -70,7 +70,7 @@ class ErrorTier(enum.Enum):
     the user but do not crash — data pauses until 1101/1102 restores it.
     """
 
-    MARKET_DATA_WARNING = "market_data_warning"
+    MARKET_DATA_WARNING = "MARKET_DATA_WARNING"
     """Market data was DELIVERED, but degraded — substituted or partial.
 
     The tier exists because "you got delayed data instead of real-time" deserves
@@ -109,7 +109,7 @@ class ErrorTier(enum.Enum):
     produced the observed retry loops.
     """
 
-    GENUINE_ERROR = "genuine_error"
+    GENUINE_ERROR = "GENUINE_ERROR"
     """A request or connection actually failed — requires action.
 
     Low/sub-1100 codes such as 502 (can't connect to TWS), 504 (not

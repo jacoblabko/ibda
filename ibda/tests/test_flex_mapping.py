@@ -19,6 +19,7 @@ from ibda.adapters.ibkr.flex.mapping import (
     _parse_dt_or_none,
     flex_sections_to_canonical,
 )
+from ibda.adapters.ibkr.flex.arrow import performance_from_sections
 from ibda.adapters.ibkr.flex.parse import _to_float, parse_statement
 from ibda.analytics.performance import compute_performance, external_flows_from_cash
 from ibda.schema import CASH, EXECUTION, NAV
@@ -1828,3 +1829,173 @@ def test_a_transfer_with_an_unparseable_date_is_dropped_not_anchored_to_1970() -
     assert _map_transfer({**base, "date_time": "20260602"}) is not None
     assert _map_transfer({**base, "date_time": "not-a-date"}) is None
     assert _map_transfer({**base, "date_time": None}) is None
+
+
+# ---------------------------------------------------------------------------
+# NAV de-duplication across overlapping <FlexStatement> blocks.
+#
+# NAV was the only one of the three canonical tables left un-de-duplicated, and it is the
+# one whose duplicates do the most damage: a repeated report date fabricates a zero-length
+# return period AND re-subtracts that date's external flow a second time.
+# ---------------------------------------------------------------------------
+_OVERLAPPING_NAV_XML = textwrap.dedent("""\
+    <FlexQueryResponse queryName="Activity" type="AF">
+    <FlexStatements count="2">
+    <FlexStatement accountId="U9999999" fromDate="2026-06-01" toDate="2026-06-03" period="Custom">
+    <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-01" total="100000"/>
+    <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-02" total="101000"/>
+    <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-03" total="102000"/>
+    </FlexStatement>
+    <FlexStatement accountId="U9999999" fromDate="2026-06-02" toDate="2026-06-04" period="Custom">
+    <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-02" total="101000"/>
+    <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-03" total="102000"/>
+    <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-04" total="103000"/>
+    </FlexStatement>
+    </FlexStatements>
+    </FlexQueryResponse>
+""")
+
+
+def test_nav_rows_are_deduped_across_overlapping_statements(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two statements sharing report dates must yield one NAV row per date.
+
+    `ibda/schema/nav.py` declares the contract "One row per report date", and
+    `analytics.benchmark._returns_by_date` treats a duplicate date as *fatal* while
+    `analytics.performance` silently mis-reported it — the two disagreed about whether the
+    same table was even valid.
+    """
+    parsed = parse_statement(_OVERLAPPING_NAV_XML)
+    assert parsed["status"] == "ok"
+    # The duplication is real at the parse layer: both statements are read in full.
+    assert len(parsed["sections"]["nav"]) == 6
+
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        canon = flex_sections_to_canonical(parsed["sections"])
+
+    dates = [r["Timestamp"].date() for r in canon["nav"]]
+    assert len(dates) == 4, f"expected one row per report date, got {dates}"
+    assert len(set(dates)) == len(dates), f"duplicate report dates survived: {dates}"
+    assert "Dropped 2 duplicate NAV row(s)" in caplog.text
+
+
+def test_duplicate_nav_dates_no_longer_distort_performance() -> None:
+    """The metrics, not just the row count — this is what the defect actually moved.
+
+    Before de-duplication the overlapping report produced extra zero-length periods, so
+    num_periods and every metric derived from the return series were wrong with no error
+    anywhere. Both statements describe the *same* four days, so the performance computed
+    from the overlapping report must equal the clean one exactly.
+    """
+    clean_xml = textwrap.dedent("""\
+        <FlexQueryResponse queryName="Activity" type="AF">
+        <FlexStatements count="1">
+        <FlexStatement accountId="U9999999" fromDate="2026-06-01" toDate="2026-06-04" period="Custom">
+        <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-01" total="100000"/>
+        <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-02" total="101000"/>
+        <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-03" total="102000"/>
+        <EquitySummaryByReportDateInBase accountId="U9999999" reportDate="2026-06-04" total="103000"/>
+        </FlexStatement>
+        </FlexStatements>
+        </FlexQueryResponse>
+    """)
+    clean_perf = performance_from_sections(parse_statement(clean_xml)["sections"])
+    overlap_perf = performance_from_sections(parse_statement(_OVERLAPPING_NAV_XML)["sections"])
+
+    assert overlap_perf.num_periods == clean_perf.num_periods == 3
+    assert overlap_perf.cumulative_return == pytest.approx(clean_perf.cumulative_return)
+    assert overlap_perf.max_drawdown == pytest.approx(clean_perf.max_drawdown)
+
+
+# ---------------------------------------------------------------------------
+# _map_execution: tradeDate fallback when the Trades section carries no Date/Time.
+# ---------------------------------------------------------------------------
+_TRADES_WITHOUT_DATETIME_XML = textwrap.dedent("""\
+    <FlexQueryResponse queryName="Activity" type="AF">
+    <FlexStatements count="1">
+    <FlexStatement accountId="U9999999" fromDate="2026-06-02" toDate="2026-06-03" period="Custom">
+    <Trades>
+      <Trade accountId="U9999999" symbol="AAPL" tradeDate="2026-06-02" quantity="100"
+             tradePrice="200" ibCommission="-1" buySell="BUY" currency="USD" assetCategory="STK"/>
+      <Trade accountId="U9999999" symbol="AAPL" tradeDate="2026-06-02" quantity="100"
+             tradePrice="200" ibCommission="-1" buySell="BUY" currency="USD" assetCategory="STK"/>
+      <Trade accountId="U9999999" symbol="AAPL" tradeDate="2026-06-03" quantity="-200"
+             tradePrice="210" ibCommission="-2" buySell="SELL" currency="USD" assetCategory="STK"/>
+    </Trades>
+    </FlexStatement>
+    </FlexStatements>
+    </FlexQueryResponse>
+""")
+
+
+def test_trade_date_is_used_when_the_trades_section_has_no_datetime(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An absent dateTime must not epoch-anchor the fill, and must warn.
+
+    `_parse_dt` warns only when its input is TRUTHY, so an empty dateTime substituted the
+    1970 epoch in total silence. `parse.py` had already extracted tradeDate; the mapper
+    simply never read it.
+    """
+    parsed = parse_statement(_TRADES_WITHOUT_DATETIME_XML)
+    assert parsed["status"] == "ok"
+
+    with caplog.at_level(logging.WARNING, logger="ibda.adapters.ibkr.flex.mapping"):
+        canon = flex_sections_to_canonical(parsed["sections"])
+
+    years = {r["Timestamp"].year for r in canon["execution"]}
+    assert years == {2026}, f"fills were epoch-anchored instead of dated: {years}"
+    assert "falling back to tradeDate" in caplog.text
+
+
+def test_trade_date_fallback_restores_ordering_but_not_identity() -> None:
+    """What the fallback does and does not fix — stated precisely, because it matters.
+
+    It DOES restore day resolution, so fills sort correctly and round-trip reconstruction
+    sees BUY-then-SELL rather than three fills stacked on 1970-01-01.
+
+    It does NOT make two genuinely identical same-day fills distinguishable: with no
+    ibExecID, and identical Account/Sym/Date/Qty/Price, the synthetic id is by construction
+    the same and `_dedupe_execution_rows` collapses them — warning that it cannot tell a
+    duplicate from two real fills and naming ibExecID as the resolution. That is a
+    documented, warned limitation of the Flex query shape, not something a date fallback
+    can repair. Asserting otherwise would encode a fix that does not exist.
+    """
+    canon = flex_sections_to_canonical(parse_statement(_TRADES_WITHOUT_DATETIME_XML)["sections"])
+    rows = sorted(canon["execution"], key=lambda r: r["Timestamp"])
+
+    # Ordering is restored: the buy precedes the sell on a real calendar.
+    assert [r["Side"] for r in rows] == ["BUY", "SELL"]
+    assert rows[0]["Timestamp"].date() < rows[1]["Timestamp"].date()
+    assert all(r["Timestamp"].year == 2026 for r in rows)
+
+
+def test_distinct_same_day_fills_are_kept_once_dated() -> None:
+    """Two same-day fills that differ in any visible field both survive.
+
+    This is the half the date fallback genuinely rescues. Before it every fill collapsed
+    onto the 1970 epoch, so the synthetic fingerprint carried no date at all and fills on
+    DIFFERENT days could collide with each other too. With the date restored, only rows
+    that are identical in every visible field remain ambiguous.
+    """
+    xml = textwrap.dedent("""\
+        <FlexQueryResponse queryName="Activity" type="AF">
+        <FlexStatements count="1">
+        <FlexStatement accountId="U9999999" fromDate="2026-06-02" toDate="2026-06-03" period="Custom">
+        <Trades>
+          <Trade accountId="U9999999" symbol="AAPL" tradeDate="2026-06-02" quantity="100"
+                 tradePrice="200" ibCommission="-1" buySell="BUY" currency="USD" assetCategory="STK"/>
+          <Trade accountId="U9999999" symbol="AAPL" tradeDate="2026-06-02" quantity="100"
+                 tradePrice="201" ibCommission="-1" buySell="BUY" currency="USD" assetCategory="STK"/>
+          <Trade accountId="U9999999" symbol="AAPL" tradeDate="2026-06-03" quantity="-200"
+                 tradePrice="210" ibCommission="-2" buySell="SELL" currency="USD" assetCategory="STK"/>
+        </Trades>
+        </FlexStatement>
+        </FlexStatements>
+        </FlexQueryResponse>
+    """)
+    canon = flex_sections_to_canonical(parse_statement(xml)["sections"])
+    buys = [r for r in canon["execution"] if r["Side"] == "BUY"]
+    assert len(buys) == 2, f"two distinguishable buys must both survive; got {buys}"
+    assert sum(r["Qty"] for r in buys) == pytest.approx(200.0)

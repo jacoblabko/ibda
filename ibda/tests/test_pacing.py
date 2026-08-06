@@ -63,7 +63,19 @@ def test_gap_larger_than_interval_resets_schedule() -> None:
     # After a large gap the governor should not accumulate "credit"
     sched = gov.acquire(now=10.0)
     assert sched == 10.0
-    assert gov.wait_for(10.0 + 1e-9) == 0.0 or True  # next after 10.0 is 10.2
+
+    # This read `assert gov.wait_for(10.0 + 1e-9) == 0.0 or True`, and the trailing comment
+    # ("next after 10.0 is 10.2") said outright that the disabled assertion was FALSE. The
+    # slot at 10.0 is taken, so the next one is 10.0 + 1/5 = 10.2 and wait_for returns ~0.2.
+    # Asserting the real value is what proves the point the test is named for: no credit
+    # accumulated over the gap (a governor that banked the idle time would return 0.0 here
+    # and let a burst through), and the spacing is exactly one interval.
+    assert gov.wait_for(10.0 + 1e-9) == pytest.approx(0.2, abs=1e-6)
+
+    # wait_for CALLS acquire, so it is not a read-only query — it consumes the slot it
+    # reports. That is the property most likely to surprise a caller who polls it, and
+    # nothing pinned it: a second call must report the slot after the one just taken.
+    assert gov.wait_for(10.0 + 1e-9) == pytest.approx(0.4, abs=1e-6)
 
 
 def test_ceiling_hz_clamps_max_hz() -> None:
