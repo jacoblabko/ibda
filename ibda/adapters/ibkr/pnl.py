@@ -133,12 +133,17 @@ def _f(val: Any) -> float | None:
     than a number, because every consumer of these columns sums them:
 
     - ``None`` — the column was absent from the row.
-    - ``NaN`` — what ``deephaven.pandas.to_pandas`` produces for a Deephaven null, which
-      is how these rows arrive (``supervisor.snapshot_raw_rows`` → ``to_pandas`` →
-      ``to_dict``). This branch was **missing**: the docstring promised it, the code did
-      not do it, and ``nan >= 1.797e308`` is ``False``, so a null P&L passed straight
-      through. One NaN poisons an entire ``sum()`` to NaN — a whole-book P&L reading
-      "nan" traced back to a single unavailable position.
+    - ``NaN`` — kept as a real branch, but **not** for the reason this docstring used to
+      give. It claimed NaN is "what ``deephaven.pandas.to_pandas`` produces for a
+      Deephaven null, which is how these rows arrive". Measured against a live JVM, it
+      is not: a ``(double)null`` reaches Python as plain ``None`` through
+      both paths — ``snapshot_rows`` yields ``None`` directly, and ``to_pandas`` yields a
+      nullable ``Float64`` whose ``<NA>`` collapses to ``None`` (not ``pandas.NA``) under
+      ``to_dict``. So on this path the ``None`` branch above is what catches a Deephaven
+      null, and the NaN branch is belt-and-braces against the other ways a NaN can enter
+      a float column. The underlying fix was still real — ``nan >= 1.797e308`` is
+      ``False``, so before it existed a NaN passed straight through, and one NaN poisons
+      an entire ``sum()``; only the account of where the NaN came from was wrong.
     - ``±Double.MAX_VALUE`` — IBKR's "not yet computed" sentinel. The magnitude test is
       ``abs()`` because **IB emits it with either sign**; see ``map_null_value`` in the
       vendored ``deephaven-ib`` fork (``_tws/ib_type_logger.py``), which states both have

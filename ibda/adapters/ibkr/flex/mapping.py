@@ -558,8 +558,16 @@ def _map_transfer(t: dict[str, Any]) -> dict[str, Any] | None:
     base magnitude back to local (``local = base / fxRateToBase``) so the pair agrees.
 
     Where it is absent we cannot tell "single-currency account, rate is 1" from "missing
-    rate on a cross-currency row", so the base value is used as-is — preserving existing
-    behaviour — and a warning is logged naming the risk. On a single-currency book
+    rate on a cross-currency row" — but we do not have to, when ``positionAmount`` is
+    present: that IS the local magnitude, and local is what ``Currency`` labels. So with no
+    usable rate the order is ``positionAmount`` first, base only as a last resort (with the
+    warning). That inverts the base-first priority stated above, deliberately and only in
+    the no-rate case: preferring base there means preferring a number in the wrong unit
+    over one in the right unit.
+
+    This branch previously fell through to the base value and suppressed the warning
+    *because* ``positionAmount`` was present — so the one case where the mismatch could be
+    corroborated was the one case that went unreported. On a single-currency book
     base == local and nothing changes either way.
 
     The rate itself is carried on the emitted row as ``FxRateToBase`` (``None`` when
@@ -587,17 +595,34 @@ def _map_transfer(t: dict[str, Any]) -> dict[str, Any] | None:
         # Amount and Currency agree. base = local * fxRateToBase, hence local = base / rate.
         if fx_rate_to_base is not None and fx_rate_to_base > 0.0:
             magnitude = abs(position_amount_in_base) / fx_rate_to_base
+        elif position_amount is not None:
+            # No usable rate, but the LOCAL magnitude is right here — and local is exactly
+            # what `Currency` labels, so there is nothing to infer.
+            #
+            # This branch used to fall through to the base value, and suppressed the warning
+            # below *precisely because* `positionAmount` was present: the one case where the
+            # mismatch could be corroborated was the one case that went unreported. Verified:
+            # positionAmountInBase=1080, positionAmount=1000, currency='EUR' emitted
+            # Amount=1080 Currency='EUR' silently. Transfers feed `external_flows_from_cash`,
+            # so an overstated flow is stripped from NAV-based returns and the settlement
+            # period's return is wrong by the FX spread.
+            #
+            # This inverts the documented source priority (base first), deliberately. That
+            # priority is right when a rate lets us convert; with no rate, preferring base
+            # means preferring a number in the wrong unit over one in the right unit. On a
+            # single-currency book the two are equal and nothing changes.
+            magnitude = abs(position_amount)
         else:
             magnitude = abs(position_amount_in_base)
-            if position_amount is None:
-                logger.warning(
-                    "_map_transfer: using positionAmountInBase (base currency) for %s but "
-                    "no fxRateToBase is present — emitting it under the local currency "
-                    "label %r. Correct only if this account's base currency IS %s.",
-                    t.get("symbol") or "<unknown>",
-                    t.get("currency"),
-                    t.get("currency"),
-                )
+            logger.warning(
+                "_map_transfer: using positionAmountInBase (base currency) for %s but "
+                "no fxRateToBase and no positionAmount are present — emitting it under "
+                "the local currency label %r. Correct only if this account's base "
+                "currency IS %s.",
+                t.get("symbol") or "<unknown>",
+                t.get("currency"),
+                t.get("currency"),
+            )
     elif position_amount is not None:
         magnitude = abs(position_amount)
     elif quantity is not None and transfer_price is not None:

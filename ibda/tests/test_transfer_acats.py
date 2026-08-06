@@ -84,8 +84,35 @@ class TestMapTransfer:
         assert result is not None
         assert result["Amount"] > 0.0
 
-    def test_valuation_precedence_position_amount_in_base_preferred(self) -> None:
-        """positionAmountInBase takes priority over all other sources."""
+    def test_with_a_rate_the_base_amount_is_preferred_and_converted(self) -> None:
+        """positionAmountInBase takes priority over all other sources WHEN convertible."""
+        t = _make_transfer(
+            positionAmountInBase=90000.0,
+            positionAmount=80000.0,
+            quantity=200.0,
+            transferPrice=350.0,
+            cashTransfer=70000.0,
+            fxRateToBase=1.125,
+        )
+        result = _map_transfer(t)
+        assert result is not None
+        assert result["Amount"] == pytest.approx(80000.0), (
+            "base 90,000 at rate 1.125 is 80,000 local, and Currency labels the local"
+        )
+
+    def test_without_a_rate_the_local_amount_wins_over_the_base_one(self) -> None:
+        """The corrected precedence, and the test that used to lock the defect in.
+
+        This asserted ``Amount == 90000.0`` for exactly these inputs — a BASE magnitude
+        emitted under a LOCAL currency label, which the function's own docstring forbids
+        ("the emitted row carries Amount and Currency together, so they must describe the
+        same thing"). With no fxRateToBase there is nothing to convert with, but
+        ``positionAmount`` IS the local magnitude, so no inference is needed.
+
+        Transfers feed ``external_flows_from_cash``, so an overstated flow is stripped from
+        NAV-based returns and the settlement period's return is silently wrong by the FX
+        spread.
+        """
         t = _make_transfer(
             positionAmountInBase=90000.0,
             positionAmount=80000.0,
@@ -95,7 +122,7 @@ class TestMapTransfer:
         )
         result = _map_transfer(t)
         assert result is not None
-        assert result["Amount"] == 90000.0
+        assert result["Amount"] == 80000.0
 
     def test_valuation_precedence_position_amount_over_qty_price(self) -> None:
         """positionAmount preferred over quantity*transferPrice."""
@@ -473,23 +500,32 @@ class TestTransferCurrencyConsistency:
         assert row["Amount"] == pytest.approx(1080.0), "behaviour preserved when no rate"
         assert "no fxRateToBase" in caplog.text
 
-    def test_no_warning_when_a_local_amount_is_available_as_corroboration(
+    def test_no_warning_when_a_local_amount_is_available_and_it_is_the_one_used(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """positionAmount present means the local value is known; nothing to warn about."""
+        """positionAmount present means the local value is known — so use it, and say nothing.
+
+        The amounts here used to be equal (84000/84000), so this test asserted only that a
+        log line was absent and could not have seen a wrong Amount at all. They now differ,
+        which is the only configuration in which the assertion means anything.
+        """
         from ibda.adapters.ibkr.flex.mapping import _map_transfer
 
         with caplog.at_level(logging.WARNING):
-            _map_transfer(
+            row = _map_transfer(
                 {
                     "symbol": "AAPL",
                     "direction": "IN",
-                    "positionAmountInBase": 84000.0,
+                    "positionAmountInBase": 90720.0,
                     "positionAmount": 84000.0,
-                    "currency": "USD",
+                    "currency": "EUR",
                     "date_time": "20260724;120000",
                 }
             )
+        assert row is not None
+        assert row["Amount"] == pytest.approx(84000.0), (
+            "the local magnitude is present, and Currency='EUR' labels the local one"
+        )
         assert "no fxRateToBase" not in caplog.text
 
 
