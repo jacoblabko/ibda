@@ -16,8 +16,8 @@ What is asserted here is the article's claim, not merely the code's current beha
 3. That deriving the stock leg from trade prices instead of ``fifoPnlRealized`` reads
    $48,443.57, which is $14,438.72 too high. This is the article's headline figure and
    the reason the fixture is shaped the way it is.
-4. In the public repo, that ``examples/roundtrip_pnl_ibda.py`` still prints the exact
-   block the article shows. Skipped in the monorepo, which has no ``examples/``.
+4. Where ``examples/roundtrip_pnl_ibda.py`` is present, it still prints the exact block the
+   article shows. Skipped automatically wherever that directory is not shipped.
 """
 from __future__ import annotations
 
@@ -193,7 +193,7 @@ def test_trade_price_derivation_overstates_the_stock_leg() -> None:
 
 @pytest.mark.skipif(
     not _EXAMPLE.exists(),
-    reason="examples/ ships in the public ibda repo only; the monorepo has no copy",
+    reason="examples/ is not present in this checkout",
 )
 def test_published_command_prints_the_published_output() -> None:
     """Run the article's command and compare stdout to the block it shows.

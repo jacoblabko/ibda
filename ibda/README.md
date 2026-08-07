@@ -51,7 +51,7 @@ query surface.
 ```python
 import ibda
 
-supervisor, port = ibda.connect_live(port=7497, client_id=<uncommon>, read_only=True)
+supervisor, port = ibda.connect_live(port=7497, client_id=7719, read_only=True)  # client_id: pick your own uncommon, unused integer
 arrow = port.table("position").snapshot()   # pyarrow.Table
 ```
 

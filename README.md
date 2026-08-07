@@ -58,7 +58,7 @@ Needs a running TWS or IB Gateway session — see `SETUP.md` before trying this.
 ```python
 import ibda
 
-supervisor, port = ibda.connect_live(port=7497, client_id=<uncommon>, read_only=True)
+supervisor, port = ibda.connect_live(port=7497, client_id=7719, read_only=True)  # client_id: pick your own uncommon, unused integer
 arrow = port.table("position").snapshot()   # pyarrow.Table
 ```
 
@@ -133,7 +133,7 @@ once.
 uv run pytest ibda/tests ibda/analytics/tests
 ```
 
-898 passed (no JVM, no TWS, no network).
+1000 passed (no JVM, no TWS, no network).
 
 ```
 uv run pytest ibda/tests_jvm

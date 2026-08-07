@@ -20,11 +20,17 @@ PyPI's `ibapi` package has exactly one release, `9.81.1.post1`, uploaded 2020-12
 never published a 10.x build there. Every consumer of a modern TWS API (`ibda` included) has to
 build the wheel from IB's own TWS API distribution.
 
-**Use `tools/build_ibapi_wheel.py`** (vendored from the same build this project was extracted
+**Use `tools/build_ibapi_wheel.py`** (vendored alongside this project
 from — it has no dependency on anything outside this file):
 
 ```bash
-uv run python tools/build_ibapi_wheel.py            # builds 10.19.04 into vendor/
+# First run, from a clean clone: `uv run` alone cannot work yet, because pyproject points
+# ibapi at vendor/, vendor/ is gitignored, and this is the script that fills it. `--no-project`
+# skips resolving the project; `--with build` supplies the one dependency the script needs.
+uv run --with build --no-project python tools/build_ibapi_wheel.py   # builds 10.19.04 into vendor/
+
+# After that, the project resolves and the ordinary form works:
+uv sync
 uv run python tools/build_ibapi_wheel.py --check     # confirms the vendored wheel matches what's installed
 ```
 
