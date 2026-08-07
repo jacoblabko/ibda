@@ -193,7 +193,21 @@ def performance_from_sections(
             "returns and a Sharpe ratio."
         )
 
-    present = sorted({r["Account"] for r in nav_rows if r.get("Account")})
+    # Derived from NAV *and* cash, not NAV alone. The multi-account guard exists to stop one
+    # account's flows being attributed to another, and cash is the side that carries the flows —
+    # so deriving the account set from the NAV section only left the guard blind in exactly the
+    # case it was written for. A report carrying an account in <CashTransactions> that is absent
+    # from EquitySummaryByReportDateInBase would show len(present) == 1, skip the guard, and fold
+    # that account's deposits into the other's flow series, silently depressing its return.
+    #
+    # Whether IBKR can actually emit such a report is still unobserved (every artifact under
+    # artifacts/flex/ is single-account). That question no longer gates correctness: if it cannot,
+    # this union equals the NAV set and nothing changes; if it can, the report is now rejected
+    # with an actionable message instead of quietly producing a wrong number.
+    present = sorted(
+        {r["Account"] for r in nav_rows if r.get("Account")}
+        | {r["Account"] for r in cash_rows if r.get("Account")}
+    )
     if account is not None:
         nav_rows = [r for r in nav_rows if r.get("Account") == account]
         cash_rows = [r for r in cash_rows if r.get("Account") == account]
