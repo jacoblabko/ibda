@@ -17,6 +17,18 @@ IBKR connector — used here as a patched fork (see [`DEPENDENCIES.md`](DEPENDEN
 keeps both behind its port/adapter surface: you get `pyarrow.Table` out and never import
 Deephaven yourself, and the offline Flex path does not start the engine at all.
 
+## What you can run from this repo alone
+
+**Read this before investing time** — the two paths are not equally reachable:
+
+| Path | State |
+|---|---|
+| **Offline, from a Flex Activity XML** | **Works from a clean clone.** Follow [`SETUP.md`](SETUP.md) step 1, then run `examples/roundtrip_pnl_ibda.py <report.xml>` — a fixture ships at `ibda/tests/fixtures/flex/`. No TWS, no engine, no market-data subscription. Verified 2026-08-07 on a fresh clone. |
+| **Live, against a TWS connection** | **Needs a build step this repo cannot do for you.** It depends on a *patched* `deephaven-ib`, which is not published as an installable package. You would build it from upstream `deephaven-examples/deephaven-ib` tag `v0.6.3` plus the patches described in [`DEPENDENCIES.md`](DEPENDENCIES.md) — that file explains what each patch fixes and why it is load-bearing, but does not ship the diffs. |
+
+The test suite reflects this: the offline and pure-logic tests run anywhere, and the JVM contract
+lane needs the fork plus a Java runtime.
+
 ## Quickstart
 
 ### Offline, from a Flex Activity XML report (no TWS, no engine, no market-data subscription)
