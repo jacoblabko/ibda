@@ -42,8 +42,9 @@ Pure module: imports only stdlib + pyarrow. No engine, no vendor SDK.
 from __future__ import annotations
 
 import logging
+import bisect
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Protocol, cast, runtime_checkable
@@ -322,6 +323,38 @@ def daily_returns(
     return [r for _pd, _d, r in _dated_returns(nav, value_column=value_column, flows=flows)]
 
 
+def _flow_window(
+    flows: Mapping[date, float] | None,
+) -> Callable[[date, date], float]:
+    """Build ``(after, through) -> net flow in the half-open period ``(after, through]``.
+
+    A flow belongs to the return period it lands *inside*, not to a NAV row whose date
+    matches it. Looking flows up by the later NAV date — ``flows.get(d)`` — silently dropped
+    every flow dated on a day with no NAV row: weekends, holidays, any non-trading day. The
+    deposit was then never subtracted from any return while still being reported in
+    ``net_external_flows`` as though it had been.
+
+    Measured on a 100k book with an identical $50,000 deposit: **+50.5%** cumulative return
+    when dated a Saturday against **+0.33%** dated the following Monday. The day of the week
+    someone wires money is not a performance signal.
+
+    Flows before the first NAV point are correctly excluded — that money is already inside
+    ``starting_nav`` — as are flows after the last, which fall outside the measured period.
+    """
+    if not flows:
+        return lambda _after, _through: 0.0
+    dates = sorted(flows)
+    cumulative = [0.0]
+    for d in dates:
+        cumulative.append(cumulative[-1] + flows[d])
+
+    def window(after: date, through: date) -> float:
+        return (cumulative[bisect.bisect_right(dates, through)]
+                - cumulative[bisect.bisect_right(dates, after)])
+
+    return window
+
+
 def _dated_returns(
     nav: pa.Table,
     *,
@@ -338,6 +371,7 @@ def _dated_returns(
     ``(prior_date, later_date, return)``.
     """
     timestamps, values = _nav_series(nav, value_column)
+    window = _flow_window(flows)
     out: list[tuple[date, date, float]] = []
     for i in range(1, len(values)):
         prev = values[i - 1]
@@ -345,7 +379,7 @@ def _dated_returns(
             continue
         prior_date = timestamps[i - 1].date()
         d = timestamps[i].date()
-        flow = flows.get(d, 0.0) if flows is not None else 0.0
+        flow = window(prior_date, d)
         out.append((prior_date, d, (values[i] - prev - flow) / prev))
     return out
 
@@ -480,9 +514,20 @@ def compute_performance(
     best_period = max(returns)
     worst_period = min(returns)
 
+    # The flow total ACTUALLY applied to returns, not every flow in the report. Summing
+    # `flows.values()` let the two disagree with nothing to show for it: a flow outside the
+    # NAV window — or, before `_flow_window`, on any non-trading day — was reported here while
+    # never reaching a return. `PerformanceSummary` renders this as "Net deposits/wd", which a
+    # reader reasonably takes to mean "and it was handled".
     net_flows = 0.0
     if flows is not None:
-        net_flows = math.fsum(flows.values())
+        window = _flow_window(flows)
+        timestamps, values = _nav_series(source, value_column)
+        net_flows = math.fsum(
+            window(timestamps[i - 1].date(), timestamps[i].date())
+            for i in range(1, len(values))
+            if values[i - 1] != 0.0
+        )
 
     # source is already validated/filtered to at most one account by _select_account
     # above, so accts (if non-empty) all agree — accts[0] is not a silent pick among

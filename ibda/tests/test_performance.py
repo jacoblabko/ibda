@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import statistics
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -193,6 +193,42 @@ def test_net_external_flows_reported() -> None:
     table = _nav_from_series([(d1, 100_000.0), (d2, 150_000.0)])
     perf = compute_performance(table, flows={d2.date(): 50_000.0})
     assert perf.net_external_flows == pytest.approx(50_000.0)
+
+
+def test_a_flow_on_a_day_with_no_nav_row_is_still_stripped() -> None:
+    """Flows were keyed by the later NAV date, so non-trading days matched nothing.
+
+    2026-06-05 is a Friday and 2026-06-08 the following Monday; a deposit dated the Saturday
+    belongs to that Friday->Monday return period. Keying on the NAV date dropped it entirely
+    while still reporting it in `net_external_flows`. Measured on a 100k book, the same
+    $50,000 gave +50.5% cumulative return dated Saturday against +0.33% dated Monday.
+    """
+    fri = datetime(2026, 6, 5, 4, tzinfo=timezone.utc)
+    mon = datetime(2026, 6, 8, 4, tzinfo=timezone.utc)
+    table = _nav_from_series([(fri, 100_000.0), (mon, 150_000.0)])
+
+    saturday = daily_returns(table, flows={date(2026, 6, 6): 50_000.0})[0]
+    monday = daily_returns(table, flows={date(2026, 6, 8): 50_000.0})[0]
+    assert saturday == pytest.approx(0.0)
+    assert saturday == pytest.approx(monday)
+
+
+def test_flows_outside_the_nav_window_are_not_counted_as_applied() -> None:
+    """`net_external_flows` must report what was subtracted, not every flow in the report.
+
+    A deposit predating the series is already inside `starting_nav`; claiming it in the flow
+    total tells a reader it was handled when no return ever saw it.
+    """
+    d1 = datetime(2026, 6, 5, 4, tzinfo=timezone.utc)
+    d2 = datetime(2026, 6, 8, 4, tzinfo=timezone.utc)
+    table = _nav_from_series([(d1, 100_000.0), (d2, 150_000.0)])
+
+    before = compute_performance(table, flows={date(2026, 6, 1): 50_000.0})
+    assert before.net_external_flows == pytest.approx(0.0)
+    assert daily_returns(table, flows={date(2026, 6, 1): 50_000.0})[0] == pytest.approx(0.50)
+
+    inside = compute_performance(table, flows={date(2026, 6, 6): 50_000.0})
+    assert inside.net_external_flows == pytest.approx(50_000.0)
 
 
 # ---------------------------------------------------------------------------
